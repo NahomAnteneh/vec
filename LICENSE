@@ -1,3 +1,4 @@
 MIT LICENCE,
 
 it is not showing nothing to commit when the index was empty
+must add a check for checking same files being added

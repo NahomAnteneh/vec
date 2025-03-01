@@ -36,6 +36,7 @@ func log(repoRoot string) error {
 			return err
 		}
 
+		fmt.Printf("Tree %s\n", commit.Tree)
 		fmt.Printf("commit %s\n", currentCommit)
 		if len(commit.Parents) > 1 {
 			fmt.Printf("Merge: %s\n", strings.Join(commit.Parents, " "))

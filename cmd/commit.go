@@ -101,7 +101,27 @@ func commit(repoRoot string, message string) error {
 		}
 	}
 
-	// Update Reflog
+	// // *** UPDATE THE INDEX *** (instead of clearing it)
+	// newCommit, err := objects.GetCommit(repoRoot, commitHash)
+	// if err != nil {
+	// 	return err
+	// }
+
+	// newTree, err := objects.GetTree(repoRoot, newCommit.Tree)
+	// if err != nil {
+	// 	return err
+	// }
+
+	// if err := updateIndexFromTree(repoRoot, index, newTree); err != nil {
+	// 	return err
+	// }
+
+	// // Write the *updated* index.
+	// if err := index.Write(); err != nil {
+	// 	return err
+	// }
+
+	//Update reflog
 	if err := updateReflog(repoRoot, parent, commitHash, branch); err != nil {
 		return err
 	}
@@ -110,6 +130,103 @@ func commit(repoRoot string, message string) error {
 	return nil
 }
 
+// updateIndexFromTree updates the index to match the given tree.
+func updateIndexFromTree(repoRoot string, index *core.Index, tree *objects.TreeObject) error {
+	// Create a map for efficient lookup of existing index entries.
+	indexMap := make(map[string]*core.IndexEntry)
+	for i := range index.Entries {
+		//Use file name to store index map
+		indexMap[filepath.Base(index.Entries[i].Filename)] = &index.Entries[i] // Use pointers
+	}
+
+	// Iterate through commit tree and update or add
+	for _, treeEntry := range tree.Entries {
+		if treeEntry.Type != "blob" {
+			continue
+		}
+		// Get file path
+		filePath, err := getFilePathFromTree(tree, treeEntry.Name)
+		if err != nil {
+			return err
+		}
+
+		if existingEntry, ok := indexMap[filepath.Base(treeEntry.Name)]; ok {
+			// File exists, update
+			existingEntry.SHA256 = treeEntry.Hash
+			absPath := filepath.Join(repoRoot, filePath)
+			fileInfo, err := os.Stat(absPath)
+			if err != nil {
+				return fmt.Errorf("failed to get file info: %w", err)
+			}
+			existingEntry.Size = fileInfo.Size()
+			existingEntry.Mtime = fileInfo.ModTime()
+		} else {
+			// New file, add to index
+			absPath := filepath.Join(repoRoot, filePath)
+			fileInfo, err := os.Stat(absPath)
+			if err != nil {
+				return fmt.Errorf("failed to get file info: %w", err)
+			}
+
+			newEntry := core.IndexEntry{
+				Mode:     treeEntry.Mode,
+				Filename: absPath, // Use absolute path
+				SHA256:   treeEntry.Hash,
+				Size:     fileInfo.Size(),
+				Mtime:    fileInfo.ModTime(),
+			}
+			index.Entries = append(index.Entries, newEntry)
+		}
+	}
+
+	// Remove index entries that are no longer in the commit tree (deleted files).
+	var updatedEntries []core.IndexEntry
+	for _, indexEntry := range index.Entries {
+		found := false
+		for _, treeEntry := range tree.Entries {
+			if treeEntry.Type != "blob" {
+				continue
+			}
+			filePath, _ := filepath.Rel(repoRoot, indexEntry.Filename)
+			if filepath.Base(filePath) == treeEntry.Name {
+				found = true
+				break
+			}
+		}
+		if found {
+			updatedEntries = append(updatedEntries, indexEntry)
+		}
+	}
+	index.Entries = updatedEntries
+
+	return nil
+}
+
+// getFilePath reconstructs the full file path from the tree, given a filename.
+func getFilePathFromTree(tree *objects.TreeObject, fileName string) (string, error) {
+	var find func(tree *objects.TreeObject, fileName, parentPath string) (string, error)
+	find = func(tree *objects.TreeObject, fileName, parentPath string) (string, error) {
+		for _, entry := range tree.Entries {
+			//If it is blob, check the name
+			if entry.Type == "blob" {
+				if entry.Name == fileName {
+					return filepath.Join(parentPath, entry.Name), nil // Return the full path
+				}
+			} else if entry.Type == "tree" { // If it is tree, dig in
+				subTree, err := objects.GetTree("", entry.Hash)
+				if err != nil {
+					return "", err
+				}
+				if foundPath, err := find(subTree, fileName, filepath.Join(parentPath, entry.Name)); err == nil && foundPath != "" {
+					return foundPath, nil
+				}
+			}
+		}
+		return "", fmt.Errorf("file not found") // Return error if not found
+	}
+	// Call the recursive function
+	return find(tree, fileName, "")
+}
 func updateReflog(repoRoot, prevCommit, commitHash, branch string) error {
 	//Update HEAD reflog
 	headReflogPath := filepath.Join(repoRoot, ".vec", "logs", "HEAD")

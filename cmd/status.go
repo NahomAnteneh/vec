@@ -51,15 +51,13 @@ func status(repoRoot string) error {
 		commitTree = objects.NewTreeObject()
 	}
 
-	// Compare Index to Commit Tree: Find new, modified (staged), and deleted files.
-	newFiles, stagedModified, stagedDeleted, untracked, modifiedNotStaged, err := compareIndexAndCommit(repoRoot, index, commitTree)
+	// Get all status information using compareStatus
+	newFiles, stagedModified, stagedDeleted, untracked, modifiedNotStaged, upToDate, err := compareStatus(repoRoot, index, commitTree)
 	if err != nil {
 		return err
 	}
-	// Get up-to-date files
-	upToDate := getUpToDateFiles(repoRoot, index, commitTree)
 
-	// Output results
+	// Output results (Git-like format).
 	branchName, err := utils.GetCurrentBranch(repoRoot)
 	if err != nil {
 		return err
@@ -102,6 +100,7 @@ func status(repoRoot string) error {
 		}
 		fmt.Println()
 	}
+
 	// Print up-to-date files only if there are other changes
 	if (len(newFiles) > 0 || len(stagedModified) > 0 || len(stagedDeleted) > 0 || len(modifiedNotStaged) > 0 || len(untracked) > 0) && len(upToDate) > 0 {
 		fmt.Println("Up-to-date files:")
@@ -115,123 +114,23 @@ func status(repoRoot string) error {
 	if len(newFiles) == 0 && len(stagedModified) == 0 && len(stagedDeleted) == 0 && len(modifiedNotStaged) == 0 && len(untracked) == 0 && len(upToDate) == 0 {
 		fmt.Println("nothing to commit, working tree clean")
 	}
+
 	return nil
 }
 
-// compareIndexAndCommit compares the index and the HEAD commit's tree, and the working directory with index.
-func compareIndexAndCommit(repoRoot string, index *core.Index, commitTree *objects.TreeObject) (newFiles []string, stagedModified []string, stagedDeleted []string, untracked []string, modifiedNotStaged []string, err error) {
-	// Create a map for efficient lookup of commit tree entries.
-	commitTreeMap := make(map[string]objects.TreeEntry)
-	for _, entry := range commitTree.Entries {
-		if entry.Type == "blob" {
-			commitTreeMap[entry.Name] = entry
-		}
-	}
-
-	// Iterate through the *index* to find new, staged modified, and deleted files.
-	for _, indexEntry := range index.Entries {
-		if commitTreeEntry, ok := commitTreeMap[indexEntry.Filename]; ok {
-			// File exists in both index and commit.
-			if indexEntry.SHA256 != commitTreeEntry.Hash {
-				stagedModified = append(stagedModified, indexEntry.Filename) // Staged modification.
-			}
-		} else {
-			// File exists in index but not in commit -> new file (staged).
-			newFiles = append(newFiles, indexEntry.Filename)
-		}
-
-		// Check for modified but not staged
-		absPath := filepath.Join(repoRoot, indexEntry.Filename)
-		currentHash, err := utils.HashFile(absPath)
-		if err != nil {
-			return nil, nil, nil, nil, nil, err
-		}
-		if currentHash != indexEntry.SHA256 {
-			modifiedNotStaged = append(modifiedNotStaged, indexEntry.Filename)
-		}
-	}
-
-	// Check for deleted files (files in commit but not in index).
-	for commitTreeFilePath, commitTreeEntry := range commitTreeMap {
-		if commitTreeEntry.Type != "blob" {
-			continue
-		}
-		foundInIndex := false
-		for _, indexEntry := range index.Entries {
-			if indexEntry.Filename == commitTreeFilePath {
-				foundInIndex = true
-				break
-			}
-		}
-		if !foundInIndex {
-			// Check if file exists in the working directory
-			absPath := filepath.Join(repoRoot, commitTreeFilePath)
-			if !utils.FileExists(absPath) {
-				stagedDeleted = append(stagedDeleted, commitTreeFilePath) // Deleted file.
-			}
-
-		}
-	}
-
-	// Find untracked files
-	untracked, _ = findUntrackedFiles(repoRoot, index)
-	return newFiles, stagedModified, stagedDeleted, untracked, modifiedNotStaged, nil
-}
-
-// findUntrackedFiles finds files that are in working directory, but not in index
-func findUntrackedFiles(repoRoot string, index *core.Index) ([]string, error) {
-	untracked := make([]string, 0)
-	err := filepath.Walk(repoRoot, func(absPath string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err // Abort if we can't walk the directory.
-		}
-
-		// Skip the .vec directory and any ignored files
-		if isIgnored, _ := utils.IsIgnored(repoRoot, absPath); isIgnored {
-			if info.IsDir() {
-				return filepath.SkipDir // Skip entire .vec directory.
-			}
-			return nil // Skip files within .vec.
-		}
-
-		if info.IsDir() {
-			return nil // Continue traversing directories.
-		}
-
-		relPath, _ := filepath.Rel(repoRoot, absPath) // Get path relative to repo root
-
-		found := false
-		for _, entry := range index.Entries {
-			if entry.Filename == relPath {
-				found = true
-				break
-			}
-		}
-
-		if !found {
-			untracked = append(untracked, relPath) // Not in index -> untracked.
-		}
-		return nil
-	})
-	return untracked, err
-}
-
-// getUpToDateFiles finds files that are identical in the working directory, index, and commit tree
-func getUpToDateFiles(repoRoot string, index *core.Index, commitTree *objects.TreeObject) []string {
-	upToDateFiles := make([]string, 0)
-
-	// Create maps for efficient lookups
+// compareStatus compares the index, working directory, and commit tree.
+func compareStatus(repoRoot string, index *core.Index, commitTree *objects.TreeObject) (newFiles []string, stagedModified []string, stagedDeleted []string, untracked []string, modifiedNotStaged []string, upToDate []string, err error) {
+	// Create maps for efficient lookups (key is relative path).
 	indexMap := make(map[string]string)
 	for _, entry := range index.Entries {
-		indexMap[entry.Filename] = entry.SHA256
+		relPath, _ := filepath.Rel(repoRoot, entry.Filename)
+		indexMap[relPath] = entry.SHA256
 	}
 
-	commitTreeMap := make(map[string]string)
-	for _, entry := range commitTree.Entries {
-		if entry.Type == "blob" {
-			commitTreeMap[entry.Name] = entry.Hash
-		}
-	}
+	commitTreeMap := make(map[string]objects.TreeEntry)
+	buildCommitTreeMap(commitTree, ".", commitTreeMap)
+
+	fmt.Print("----- ", commitTreeMap, "-----\n")
 
 	// Iterate through files in the working directory
 	filepath.Walk(repoRoot, func(absPath string, info os.FileInfo, err error) error {
@@ -249,27 +148,94 @@ func getUpToDateFiles(repoRoot string, index *core.Index, commitTree *objects.Tr
 		if info.IsDir() {
 			return nil
 		}
-		relPath, _ := filepath.Rel(repoRoot, absPath)
+		relPath, err := filepath.Rel(repoRoot, absPath)
+		if err != nil {
+			return fmt.Errorf("failed to get relative path: %w", err)
+		}
 
-		// Check if the file exists in index and commit and if hashes match
 		indexHash, indexExists := indexMap[relPath]
 		commitHash, commitExists := commitTreeMap[relPath]
 
-		//The file must present in all to be up-to-date
-		if indexExists && commitExists {
-			currentHash, err := utils.HashFile(absPath)
-			if err != nil {
-				return err
-			}
-			// If all hashes are equal, file is up-to-date
-			if currentHash == indexHash && indexHash == commitHash {
-				upToDateFiles = append(upToDateFiles, relPath)
-			}
+		currentHash, err := utils.HashFile(absPath)
+		if err != nil {
+			return err
 		}
 
+		if indexExists && commitExists {
+			// File exists in index, commit tree, and working directory.
+			if indexHash == commitHash.Hash {
+				if currentHash == indexHash {
+					// Up to date
+					upToDate = append(upToDate, relPath)
+				} else {
+					// Modified, not staged.
+					modifiedNotStaged = append(modifiedNotStaged, relPath)
+				}
+			} else { // indexHash != commitHash
+				if currentHash != indexHash {
+					// modified and staged
+					stagedModified = append(stagedModified, relPath)
+					modifiedNotStaged = append(modifiedNotStaged, relPath)
+				} else {
+					//staged modified
+					stagedModified = append(stagedModified, relPath)
+				}
+			}
+		} else if indexExists {
+			// File exists only in index -> new file (staged).
+			newFiles = append(newFiles, relPath)
+			// Check if it is modified
+			if currentHash != indexHash {
+				modifiedNotStaged = append(modifiedNotStaged, relPath)
+			}
+		} else if commitExists {
+			// File exists in commit tree but not in index
+			if !utils.FileExists(absPath) {
+				// Deleted
+				stagedDeleted = append(stagedDeleted, relPath)
+			}
+		} else {
+			// File exists only in the working directory -> untracked
+			untracked = append(untracked, relPath)
+		}
 		return nil
 	})
-	return upToDateFiles
+	// Remove duplication in modifiedNotStaged
+	modifiedNotStaged = removeDuplicates(modifiedNotStaged)
+	return
+}
+
+// buildCommitTreeMap recursively builds a map of commit tree entries.
+func buildCommitTreeMap(tree *objects.TreeObject, parentPath string, treeMap map[string]objects.TreeEntry) {
+	for _, entry := range tree.Entries {
+		entryPath := filepath.Join(parentPath, entry.Name)
+		if entry.Type == "blob" {
+			treeMap[entryPath] = entry
+		} else if entry.Type == "tree" {
+			subTree, err := objects.GetTree("", entry.Hash) // Empty repoRoot, as it's not used in GetTree
+			fmt.Print("-----", entry.Hash, "-----\n")
+			if err != nil {
+				// Handle error appropriately, maybe log it and continue
+				fmt.Fprintf(os.Stderr, "Error getting subtree: %v\n", err)
+				continue
+			}
+			buildCommitTreeMap(subTree, entry.Name, treeMap) // Recursive call
+		}
+	}
+}
+
+// Helper function to remove duplicate strings from a slice.
+func removeDuplicates(elements []string) []string {
+	encountered := map[string]bool{}
+	result := []string{}
+
+	for v := range elements {
+		if encountered[elements[v]] == false {
+			encountered[elements[v]] = true
+			result = append(result, elements[v])
+		}
+	}
+	return result
 }
 
 func init() {

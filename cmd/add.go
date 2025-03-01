@@ -28,7 +28,6 @@ var addCmd = &cobra.Command{
 
 		for _, arg := range args {
 			// Handle potential glob patterns (e.g., *, ?, []).
-			// No change here: Glob is working correctly.
 			files, err := filepath.Glob(filepath.Join(repoRoot, arg))
 			if err != nil {
 				return fmt.Errorf("invalid glob pattern %s: %w", arg, err)
@@ -39,12 +38,12 @@ var addCmd = &cobra.Command{
 				continue // Skip to the next argument
 			}
 
-			for _, file := range files {
-				// addFileOrDir now gets the *absolute* path.
-				err = addFileOrDir(repoRoot, index, file)
+			for _, absPath := range files { // files contains *absolute* paths
+				err = addFileOrDir(repoRoot, index, absPath) // Pass *absolute* path
 				if err != nil {
 					return err
 				}
+
 			}
 		}
 
@@ -57,8 +56,8 @@ var addCmd = &cobra.Command{
 }
 
 // addFileOrDir adds a file or directory (recursively) to the index.
+// Now takes only absPath (for both file operations and index.Add).
 func addFileOrDir(repoRoot string, index *core.Index, absPath string) error {
-	// Check for ignored files/directories.
 	if isIgnored, _ := utils.IsIgnored(repoRoot, absPath); isIgnored {
 		return nil
 	}
@@ -82,24 +81,24 @@ func addFileOrDir(repoRoot string, index *core.Index, absPath string) error {
 			}
 		}
 	} else {
-		// Calculate the *relative* path here, before calling index.Add.
-		relPath, err := filepath.Rel(repoRoot, absPath)
-		if err != nil {
-			return fmt.Errorf("failed to get relative path: %w", err)
-		}
+		// Add the file to the index
 
-		// Add the file to the index.
 		// Add to blob
-		content, err := os.ReadFile(absPath) //Read with absolute path
+		content, err := os.ReadFile(absPath) // Use absolute path here
 		if err != nil {
 			return err
 		}
-		if _, err := objects.CreateBlob(repoRoot, content); err != nil {
+
+		// fmt.Print("-----", absPath, "------\n")
+
+		hash, err := objects.CreateBlob(repoRoot, content)
+		if err != nil {
 			return err
 		}
 
-		if err := index.Add(repoRoot, relPath); err != nil { // Pass relPath to index.Add
-			return err // Index.Add already wraps errors.
+		// Pass the *absolute* path to index.Add.
+		if err := index.Add(repoRoot, absPath, hash); err != nil {
+			return err
 		}
 	}
 
