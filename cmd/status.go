@@ -111,7 +111,7 @@ func status(repoRoot string) error {
 		fmt.Println()
 	}
 
-	if len(newFiles) == 0 && len(stagedModified) == 0 && len(stagedDeleted) == 0 && len(modifiedNotStaged) == 0 && len(untracked) == 0 && len(upToDate) == 0 {
+	if len(newFiles) == 0 && len(stagedModified) == 0 && len(stagedDeleted) == 0 && len(modifiedNotStaged) == 0 && len(untracked) == 0 {
 		fmt.Println("nothing to commit, working tree clean")
 	}
 
@@ -130,9 +130,9 @@ func compareStatus(repoRoot string, index *core.Index, commitTree *objects.TreeO
 	commitTreeMap := make(map[string]objects.TreeEntry)
 	buildCommitTreeMap(commitTree, ".", commitTreeMap)
 
-	fmt.Print("----- ", commitTreeMap, "-----\n")
+	// fmt.Print("----- ", commitTreeMap, "-----\n")
 
-	// Iterate through files in the working directory
+	// Iterate through files in the working director
 	filepath.Walk(repoRoot, func(absPath string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -209,17 +209,19 @@ func compareStatus(repoRoot string, index *core.Index, commitTree *objects.TreeO
 func buildCommitTreeMap(tree *objects.TreeObject, parentPath string, treeMap map[string]objects.TreeEntry) {
 	for _, entry := range tree.Entries {
 		entryPath := filepath.Join(parentPath, entry.Name)
+		// fmt.Print("-----", entryPath, "-----\n")
 		if entry.Type == "blob" {
 			treeMap[entryPath] = entry
 		} else if entry.Type == "tree" {
 			subTree, err := objects.GetTree("", entry.Hash) // Empty repoRoot, as it's not used in GetTree
-			fmt.Print("-----", entry.Hash, "-----\n")
+			// fmt.Print("-----", entry.Hash, "-----\n")
 			if err != nil {
 				// Handle error appropriately, maybe log it and continue
 				fmt.Fprintf(os.Stderr, "Error getting subtree: %v\n", err)
 				continue
 			}
-			buildCommitTreeMap(subTree, entry.Name, treeMap) // Recursive call
+			newPath := filepath.Join(parentPath, entry.Name)
+			buildCommitTreeMap(subTree, newPath, treeMap) // Recursive call
 		}
 	}
 }
