@@ -1,4 +1,3 @@
-// cmd/catfile.go
 package cmd
 
 import (
@@ -15,7 +14,7 @@ import (
 var catFileCmd = &cobra.Command{
 	Use:   "cat-file (-p <hash> | -t <hash> | -s <hash>)",
 	Short: "Provide content or type and size information for repository objects",
-	Args:  cobra.ExactArgs(1), // Exactly one argument: the object hash.
+	Args:  cobra.ExactArgs(1), // Exactly one argument: the object hash
 	RunE: func(cmd *cobra.Command, args []string) error {
 		repoRoot, err := utils.GetVecRoot()
 		if err != nil {
@@ -24,12 +23,12 @@ var catFileCmd = &cobra.Command{
 
 		objectHash := args[0]
 
-		// Check that the object hash is valid (at a basic level - correct length).
+		// Check that the object hash is valid (basic length check for SHA-256)
 		if len(objectHash) != 64 {
 			return fmt.Errorf("invalid object hash: %s", objectHash)
 		}
 
-		// Check flags.  Exactly one of -p, -t, or -s MUST be provided.
+		// Check flags: exactly one of -p, -t, or -s must be provided
 		prettyPrint, _ := cmd.Flags().GetBool("pretty-print")
 		objectType, _ := cmd.Flags().GetBool("type")
 		objectSize, _ := cmd.Flags().GetBool("size")
@@ -61,8 +60,6 @@ var catFileCmd = &cobra.Command{
 
 func catFilePrettyPrint(repoRoot, objectHash string) error {
 	objectPath := objects.GetObjectPath(repoRoot, objectHash)
-
-	// Check if the object file exists.
 	if !utils.FileExists(objectPath) {
 		return fmt.Errorf("object not found: %s", objectHash)
 	}
@@ -70,19 +67,19 @@ func catFilePrettyPrint(repoRoot, objectHash string) error {
 	// Read object content
 	objectContent, err := os.ReadFile(objectPath)
 	if err != nil {
-		return fmt.Errorf("failed to read the object file: %w", err)
+		return fmt.Errorf("failed to read object file: %w", err)
 	}
 
-	//get object type
+	// Get object type
 	objectType, err := getObjectType(objectContent)
 	if err != nil {
 		return err
 	}
 
-	// Separate header and content
-	headerEnd := bytes.IndexByte(objectContent, '\n')
+	// Separate header and content using null byte (\x00)
+	headerEnd := bytes.IndexByte(objectContent, '\x00')
 	if headerEnd == -1 {
-		return fmt.Errorf("invalid object format: missing header")
+		return fmt.Errorf("invalid object format: missing header delimiter")
 	}
 	content := objectContent[headerEnd+1:]
 
@@ -92,27 +89,26 @@ func catFilePrettyPrint(repoRoot, objectHash string) error {
 	case "tree":
 		tree, err := objects.GetTree(repoRoot, objectHash)
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to get tree: %w", err)
 		}
 		for _, entry := range tree.Entries {
-			fmt.Printf("%d %s %s\t%s\n", entry.Mode, entry.Type, entry.Hash, entry.Name)
+			fmt.Printf("%06o %s %s\t%s\n", entry.Mode, entry.Type, entry.Hash, entry.Name)
 		}
 	case "commit":
 		commit, err := objects.GetCommit(repoRoot, objectHash)
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to get commit: %w", err)
 		}
 		printCommit(commit)
 	default:
-		return fmt.Errorf("invalid object type")
+		return fmt.Errorf("invalid object type: %s", objectType)
 	}
 
 	return nil
 }
+
 func catFileType(repoRoot, objectHash string) error {
 	objectPath := objects.GetObjectPath(repoRoot, objectHash)
-
-	// Check if the object file exists.
 	if !utils.FileExists(objectPath) {
 		return fmt.Errorf("object not found: %s", objectHash)
 	}
@@ -120,9 +116,10 @@ func catFileType(repoRoot, objectHash string) error {
 	// Read object content
 	objectContent, err := os.ReadFile(objectPath)
 	if err != nil {
-		return fmt.Errorf("failed to read the object file: %w", err)
+		return fmt.Errorf("failed to read object file: %w", err)
 	}
 
+	// Get object type
 	objectType, err := getObjectType(objectContent)
 	if err != nil {
 		return err
@@ -131,10 +128,9 @@ func catFileType(repoRoot, objectHash string) error {
 	fmt.Println(objectType)
 	return nil
 }
+
 func catFileSize(repoRoot, objectHash string) error {
 	objectPath := objects.GetObjectPath(repoRoot, objectHash)
-
-	// Check if the object file exists.
 	if !utils.FileExists(objectPath) {
 		return fmt.Errorf("object not found: %s", objectHash)
 	}
@@ -142,40 +138,46 @@ func catFileSize(repoRoot, objectHash string) error {
 	// Read object content
 	objectContent, err := os.ReadFile(objectPath)
 	if err != nil {
-		return fmt.Errorf("failed to read the object file: %w", err)
+		return fmt.Errorf("failed to read object file: %w", err)
 	}
-	// Separate header and content
-	headerEnd := bytes.IndexByte(objectContent, '\n')
-	if headerEnd == -1 {
-		return fmt.Errorf("invalid object format: missing header")
-	}
-	content := objectContent[headerEnd+1:]
 
-	fmt.Println(len(content))
+	// Parse header to get size
+	headerEnd := bytes.IndexByte(objectContent, '\x00')
+	if headerEnd == -1 {
+		return fmt.Errorf("invalid object format: missing header delimiter")
+	}
+	header := string(objectContent[:headerEnd])
+	parts := strings.SplitN(header, " ", 2)
+	if len(parts) != 2 {
+		return fmt.Errorf("invalid object format: invalid header: %s", header)
+	}
+	sizeStr := parts[1] // Size is the second part of the header
+	fmt.Println(sizeStr)
 	return nil
 }
 
 // getObjectType determines the type of an object based on its content.
 func getObjectType(content []byte) (string, error) {
-	headerEnd := bytes.IndexByte(content, '\n')
+	headerEnd := bytes.IndexByte(content, '\x00')
 	if headerEnd == -1 {
-		return "", fmt.Errorf("invalid object format: missing header")
+		return "", fmt.Errorf("invalid object format: missing header delimiter")
 	}
 	header := string(content[:headerEnd])
 	parts := strings.SplitN(header, " ", 2)
 	if len(parts) != 2 {
-		return "", fmt.Errorf("invalid object format: invalid header")
+		return "", fmt.Errorf("invalid object format: invalid header: %s", header)
 	}
-	return parts[0], nil // Return object type
+	return parts[0], nil // Return object type (e.g., "tree", "blob", "commit")
 }
-func printCommit(commit *objects.Commit) {
 
+// printCommit displays a commit object in a human-readable format.
+func printCommit(commit *objects.Commit) {
 	fmt.Printf("tree %s\n", commit.Tree)
 	for _, parent := range commit.Parents {
 		fmt.Printf("parent %s\n", parent)
 	}
 	fmt.Printf("author %s %d\n", commit.Author, commit.Timestamp)
-	fmt.Println()
+	fmt.Println() // Extra newline before message
 	fmt.Println(commit.Message)
 }
 
