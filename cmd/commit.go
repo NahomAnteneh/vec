@@ -5,12 +5,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 
-	"github.com/NahomAnteneh/vec/internal/core"
 	"github.com/NahomAnteneh/vec/internal/objects"
+	"github.com/NahomAnteneh/vec/internal/staging"
 	"github.com/NahomAnteneh/vec/utils"
 	"github.com/spf13/cobra"
 )
@@ -33,7 +32,7 @@ var commitCmd = &cobra.Command{
 // commit creates a new commit in the repository.
 func commit(repoRoot, message string) error {
 	// Load the index to check for staged changes
-	index, err := core.LoadIndex(repoRoot)
+	index, err := staging.LoadIndex(repoRoot)
 	if err != nil {
 		return fmt.Errorf("failed to load index: %w", err)
 	}
@@ -80,7 +79,7 @@ func commit(repoRoot, message string) error {
 	}
 
 	// Create tree object from the index
-	treeHash, err := createTreeFromIndex(repoRoot, index)
+	treeHash, err := staging.CreateTreeFromIndex(repoRoot, index)
 	if err != nil {
 		return fmt.Errorf("failed to create tree from index: %w", err)
 	}
@@ -116,120 +115,6 @@ func commit(repoRoot, message string) error {
 	// Display success message with short commit hash
 	fmt.Printf("[(%s) %s] %s\n", branch, commitHash[:7], message)
 	return nil
-}
-
-// createTreeFromIndex builds a tree object from stage 0 index entries, including subtrees
-func createTreeFromIndex(repoRoot string, index *core.Index) (string, error) {
-	// Map to group entries by their directory structure
-	treeMap := make(map[string][]objects.TreeEntry)
-
-	// Populate treeMap with intermediate directories and file entries
-	for _, entry := range index.Entries {
-		if entry.Stage != 0 {
-			continue // Only process stage 0 (staged changes)
-		}
-		relPath := entry.FilePath // e.g., "a/b/c.txt"
-		parts := strings.Split(relPath, string(filepath.Separator))
-
-		// Create intermediate directory keys
-		var curPath string
-		for i := range len(parts) - 1 {
-			if i == 0 {
-				curPath = parts[i]
-			} else {
-				curPath = filepath.Join(curPath, parts[i])
-			}
-			if _, ok := treeMap[curPath]; !ok {
-				treeMap[curPath] = []objects.TreeEntry{}
-			}
-		}
-
-		// Add the file blob in its parent directory
-		parentPath := strings.Join(parts[:len(parts)-1], string(filepath.Separator))
-		fileName := parts[len(parts)-1]
-		treeEntry := objects.TreeEntry{
-			Mode:     entry.Mode,
-			Name:     fileName,
-			Hash:     entry.SHA256,
-			Type:     "blob",
-			FullPath: relPath,
-		}
-		if parentPath == "" {
-			treeMap[""] = append(treeMap[""], treeEntry) // Root-level files
-		} else {
-			treeMap[parentPath] = append(treeMap[parentPath], treeEntry)
-		}
-	}
-
-	// Build the tree hierarchy starting from the root
-	rootEntries, err := buildTreeHierarchy(repoRoot, "", treeMap)
-	if err != nil {
-		return "", fmt.Errorf("failed to build tree hierarchy: %w", err)
-	}
-
-	// Create the root tree with all entries
-	return objects.CreateTreeFromEntries(repoRoot, rootEntries)
-}
-
-// buildTreeHierarchy constructs a hierarchical tree structure from the tree map.
-func buildTreeHierarchy(repoRoot, dirPath string, treeMap map[string][]objects.TreeEntry) ([]objects.TreeEntry, error) {
-	var entries []objects.TreeEntry
-
-	// Add files directly in this directory
-	if files, exists := treeMap[dirPath]; exists {
-		entries = append(entries, files...)
-	}
-
-	// Find immediate child directories by scanning all keys
-	subDirs := make(map[string]struct{})
-	for path := range treeMap {
-		if path == dirPath || !strings.HasPrefix(path, dirPath) {
-			continue
-		}
-		relative := strings.TrimPrefix(path, dirPath)
-		if relative == path || relative == "" {
-			continue
-		}
-		relative = strings.TrimPrefix(relative, string(filepath.Separator))
-		if relative == "" {
-			continue
-		}
-		parts := strings.SplitN(relative, string(filepath.Separator), 2)
-		if len(parts) > 0 {
-			subDirs[parts[0]] = struct{}{} // Only immediate children
-		}
-	}
-
-	// Recursively build subtrees for each subdirectory
-	for subDir := range subDirs {
-		fullSubDir := subDir
-		if dirPath != "" {
-			fullSubDir = filepath.Join(dirPath, subDir)
-		}
-		subEntries, err := buildTreeHierarchy(repoRoot, fullSubDir, treeMap)
-		if err != nil {
-			return nil, err
-		}
-		// Create a subtree and get its hash
-		subTreeHash, err := objects.CreateTreeFromEntries(repoRoot, subEntries)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create subtree for '%s': %w", fullSubDir, err)
-		}
-		entries = append(entries, objects.TreeEntry{
-			Mode:     040000, // Directory mode
-			Name:     subDir,
-			Hash:     subTreeHash,
-			Type:     "tree",
-			FullPath: fullSubDir,
-		})
-	}
-
-	// Sort entries lexicographically by name for Git-like consistency
-	sort.Slice(entries, func(i, j int) bool {
-		return entries[i].Name < entries[j].Name
-	})
-
-	return entries, nil
 }
 
 // init registers the commit command and its flags.

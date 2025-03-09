@@ -3,7 +3,7 @@ package cmd
 import (
 	"fmt"
 
-	"github.com/NahomAnteneh/vec/internal/core"
+	"github.com/NahomAnteneh/vec/internal/merge"
 	"github.com/NahomAnteneh/vec/utils"
 	"github.com/spf13/cobra"
 )
@@ -28,7 +28,7 @@ Resolve conflicts manually and commit the result to complete the merge.`,
 		sourceBranch := args[0]
 
 		// Perform the merge
-		hasConflicts, err := core.Merge(repoRoot, sourceBranch)
+		hasConflicts, err := merge.Merge(repoRoot, sourceBranch)
 		if err != nil {
 			return fmt.Errorf("merge failed: %w", err)
 		}

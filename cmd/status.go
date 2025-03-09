@@ -6,8 +6,8 @@ import (
 	"path/filepath"
 	"sort"
 
-	"github.com/NahomAnteneh/vec/internal/core"
 	"github.com/NahomAnteneh/vec/internal/objects"
+	"github.com/NahomAnteneh/vec/internal/staging"
 	"github.com/NahomAnteneh/vec/utils"
 	"github.com/spf13/cobra"
 )
@@ -27,7 +27,7 @@ var statusCmd = &cobra.Command{
 
 func status(repoRoot string) error {
 	// Load the index
-	index, err := core.LoadIndex(repoRoot)
+	index, err := staging.LoadIndex(repoRoot)
 	if err != nil {
 		return fmt.Errorf("failed to read index: %w", err)
 	}
@@ -124,7 +124,7 @@ func status(repoRoot string) error {
 }
 
 // compareStatus compares the commit tree, index, and working directory.
-func compareStatus(repoRoot string, index *core.Index, commitTree *objects.TreeObject) (
+func compareStatus(repoRoot string, index *staging.Index, commitTree *objects.TreeObject) (
 	newFiles, stagedModified, stagedDeleted, untracked, modifiedNotStaged, deletedNotStaged []string, err error) {
 
 	// Build maps for efficient lookup

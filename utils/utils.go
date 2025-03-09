@@ -432,3 +432,39 @@ func UnsetConfigValue(repoRoot string, key string, global bool) error {
 
 	return nil
 }
+
+// ReadHEAD retrieves the commit ID that HEAD points to.
+func ReadHEAD(repoRoot string) (string, error) {
+	headFile := filepath.Join(repoRoot, ".vec", "HEAD")
+	content, err := os.ReadFile(headFile)
+	if err != nil {
+		return "", fmt.Errorf("failed to read HEAD file: %w", err)
+	}
+
+	ref := strings.TrimSpace(string(content))
+	if strings.HasPrefix(ref, "ref: ") {
+		refPath := strings.TrimSpace(ref[5:])
+		refFile := filepath.Join(repoRoot, ".vec", refPath)
+		commitID, err := os.ReadFile(refFile)
+		if err != nil {
+			return "", fmt.Errorf("failed to read reference file '%s': %w", refPath, err)
+		}
+		return strings.TrimSpace(string(commitID)), nil
+	}
+
+	if len(ref) == 64 && IsValidHex(ref) { // Assuming SHA-256 (64 chars)
+		return ref, nil
+	}
+
+	return "", fmt.Errorf("invalid HEAD content: %s", ref)
+}
+
+// isValidHex checks if a string is a valid hexadecimal value.
+func IsValidHex(s string) bool {
+	for _, c := range s {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return false
+		}
+	}
+	return true
+}

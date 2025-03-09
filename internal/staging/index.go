@@ -1,4 +1,4 @@
-package core
+package staging
 
 import (
 	"bytes"
@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/NahomAnteneh/vec/internal/objects"
@@ -150,7 +151,7 @@ func (i *Index) GetStagedFiles() []string {
 // HasUncommittedChanges checks for uncommitted changes in the working directory or index.
 func (i *Index) HasUncommittedChanges(repoRoot string) bool {
 	// Get the HEAD commit to compare against
-	headCommitID, err := ReadHEAD(repoRoot)
+	headCommitID, err := utils.ReadHEAD(repoRoot)
 	if err != nil {
 		return true // Conservatively assume changes if HEAD can't be read
 	}
@@ -414,6 +415,62 @@ func DeserializeIndex(repoRoot string, data []byte) (*Index, error) {
 	}
 
 	return index, nil
+}
+
+// CreateTreeFromIndex builds a Git-style tree object directly from the index.
+// It walks over stage-0 index entries, groups files into the proper directory structure
+// (ensuring every intermediate directory is present), and returns the hash of the root tree.
+func CreateTreeFromIndex(repoRoot string, index *Index) (string, error) {
+	if repoRoot == "" {
+		return "", fmt.Errorf("repository root cannot be empty")
+	}
+
+	// Build a map: directory path -> list of TreeEntry
+	// Keys are full relative paths for directories.
+	treeMap := make(map[string][]objects.TreeEntry)
+
+	// Process each stage-0 index entry.
+	for _, ie := range index.Entries {
+		if ie.Stage != 0 {
+			continue
+		}
+		// ie.FilePath should be a relative path like "a/b/c.txt".
+		if ie.FilePath == "" {
+			return "", fmt.Errorf("index entry for file with hash '%s' has empty FilePath", ie.SHA256)
+		}
+		// Ensure every intermediate directory is present.
+		parts := strings.Split(ie.FilePath, string(filepath.Separator))
+		for i := 1; i < len(parts); i++ {
+			dirKey := filepath.Join(parts[:i]...)
+			if _, exists := treeMap[dirKey]; !exists {
+				// Create empty slice for directory so that recursion will pick it up.
+				treeMap[dirKey] = []objects.TreeEntry{}
+			}
+		}
+		// Determine parent directory.
+		parentDir := filepath.Dir(ie.FilePath)
+		if parentDir == "." {
+			parentDir = ""
+		}
+		// Create a tree entry for the file (blob).
+		fileEntry := objects.TreeEntry{
+			Mode:     ie.Mode,
+			Name:     parts[len(parts)-1],
+			Hash:     ie.SHA256,
+			Type:     "blob",
+			FullPath: ie.FilePath,
+		}
+		treeMap[parentDir] = append(treeMap[parentDir], fileEntry)
+	}
+
+	// Build the hierarchical tree starting at the root ("").
+	rootEntries, err := objects.BuildTreeRecursively("", treeMap, repoRoot)
+	if err != nil {
+		return "", fmt.Errorf("failed to build tree hierarchy: %w", err)
+	}
+
+	// Create and write the root tree object.
+	return objects.CreateTreeObject(repoRoot, rootEntries)
 }
 
 // // Write serializes the index entries and writes them to the index file.

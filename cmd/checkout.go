@@ -7,8 +7,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/NahomAnteneh/vec/internal/core"
 	"github.com/NahomAnteneh/vec/internal/objects"
+	"github.com/NahomAnteneh/vec/internal/staging"
 	"github.com/NahomAnteneh/vec/utils"
 	"github.com/spf13/cobra"
 )
@@ -30,7 +30,7 @@ var checkoutCmd = &cobra.Command{
 // checkout switches the working directory and index to the specified branch or commit.
 func checkout(repoRoot, target string) error {
 	// Load index and check for uncommitted changes
-	index, err := core.LoadIndex(repoRoot)
+	index, err := staging.LoadIndex(repoRoot)
 	if err != nil {
 		return fmt.Errorf("failed to load index: %w", err)
 	}
@@ -181,8 +181,8 @@ func collectTreeEntries(tree *objects.TreeObject, prefix string, entries map[str
 }
 
 // createIndexFromTree creates a new index from the specified tree.
-func createIndexFromTree(repoRoot string, tree *objects.TreeObject) (*core.Index, error) {
-	index := core.NewIndex(repoRoot)
+func createIndexFromTree(repoRoot string, tree *objects.TreeObject) (*staging.Index, error) {
+	index := staging.NewIndex(repoRoot)
 	treeFiles := make(map[string]objects.TreeEntry)
 	collectTreeEntries(tree, "", treeFiles)
 
@@ -195,7 +195,7 @@ func createIndexFromTree(repoRoot string, tree *objects.TreeObject) (*core.Index
 		if err != nil {
 			return nil, fmt.Errorf("failed to stat %s: %w", relPath, err)
 		}
-		index.Entries = append(index.Entries, core.IndexEntry{
+		index.Entries = append(index.Entries, staging.IndexEntry{
 			Mode:     entry.Mode,
 			FilePath: relPath,
 			SHA256:   entry.Hash,

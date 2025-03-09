@@ -1,4 +1,4 @@
-package core
+package merge
 
 import (
 	"bytes"
@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/NahomAnteneh/vec/internal/objects"
+	"github.com/NahomAnteneh/vec/internal/staging"
+	"github.com/NahomAnteneh/vec/utils"
 )
 
 // MergeResult captures the outcome of the merge operation.
@@ -23,7 +25,7 @@ func Merge(repoRoot, sourceBranch string) (bool, error) {
 	if _, err := os.Stat(filepath.Join(repoRoot, ".vec")); os.IsNotExist(err) {
 		return false, fmt.Errorf("not a vec repository: %s", repoRoot)
 	}
-	index, err := LoadIndex(repoRoot)
+	index, err := staging.LoadIndex(repoRoot)
 	if err != nil {
 		return false, fmt.Errorf("failed to load index: %w", err)
 	}
@@ -38,7 +40,7 @@ func Merge(repoRoot, sourceBranch string) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("failed to determine current branch: %w", err)
 	}
-	headCommitID, err := ReadHEAD(repoRoot)
+	headCommitID, err := utils.ReadHEAD(repoRoot)
 	if err != nil {
 		return false, fmt.Errorf("failed to read HEAD: %w", err)
 	}
@@ -127,7 +129,7 @@ func Merge(repoRoot, sourceBranch string) (bool, error) {
 	}
 
 	// Create tree from merged index (implementation needed)
-	treeID, err := createTreeFromIndex(repoRoot, index)
+	treeID, err := staging.CreateTreeFromIndex(repoRoot, index)
 	if err != nil {
 		return false, fmt.Errorf("failed to create tree from index: %w", err)
 	}
@@ -156,7 +158,7 @@ func Merge(repoRoot, sourceBranch string) (bool, error) {
 }
 
 // performMerge executes a three-way merge between base, ours, and theirs trees, updating the index and working directory.
-func performMerge(repoRoot string, index *Index, baseTree, ourTree, theirTree *objects.TreeObject) (MergeResult, error) {
+func performMerge(repoRoot string, index *staging.Index, baseTree, ourTree, theirTree *objects.TreeObject) (MergeResult, error) {
 	var result MergeResult
 
 	// Build maps for quick lookup
@@ -285,7 +287,7 @@ func performMerge(repoRoot string, index *Index, baseTree, ourTree, theirTree *o
 }
 
 // handleConflict creates a conflict file in the working directory and updates the index with conflict entries.
-func handleConflict(repoRoot string, index *Index, filePath string, baseHash, ourHash, theirHash string, baseMode, ourMode, theirMode int32) error {
+func handleConflict(repoRoot string, index *staging.Index, filePath string, baseHash, ourHash, theirHash string, baseMode, ourMode, theirMode int32) error {
 	absPath := filepath.Join(repoRoot, filePath)
 
 	// Retrieve content for present versions
@@ -372,7 +374,7 @@ func handleConflict(repoRoot string, index *Index, filePath string, baseHash, ou
 }
 
 // copyBlobAndAddToIndex copies a blob to the working directory and adds it to the index at stage 0.
-func copyBlobAndAddToIndex(repoRoot string, index *Index, hash, filePath string, mode int32) error {
+func copyBlobAndAddToIndex(repoRoot string, index *staging.Index, hash, filePath string, mode int32) error {
 	content, err := objects.GetBlob(repoRoot, hash)
 	if err != nil {
 		return fmt.Errorf("failed to get blob '%s': %w", hash, err)
@@ -467,32 +469,6 @@ func GetCurrentBranch(repoRoot string) (string, error) {
 	return parts[2], nil
 }
 
-// ReadHEAD retrieves the commit ID that HEAD points to.
-func ReadHEAD(repoRoot string) (string, error) {
-	headFile := filepath.Join(repoRoot, ".vec", "HEAD")
-	content, err := os.ReadFile(headFile)
-	if err != nil {
-		return "", fmt.Errorf("failed to read HEAD file: %w", err)
-	}
-
-	ref := strings.TrimSpace(string(content))
-	if strings.HasPrefix(ref, "ref: ") {
-		refPath := strings.TrimSpace(ref[5:])
-		refFile := filepath.Join(repoRoot, ".vec", refPath)
-		commitID, err := os.ReadFile(refFile)
-		if err != nil {
-			return "", fmt.Errorf("failed to read reference file '%s': %w", refPath, err)
-		}
-		return strings.TrimSpace(string(commitID)), nil
-	}
-
-	if len(ref) == 64 && isValidHex(ref) { // Assuming SHA-256 (64 chars)
-		return ref, nil
-	}
-
-	return "", fmt.Errorf("invalid HEAD content: %s", ref)
-}
-
 // CheckoutCommit updates the working directory and index to match a commit.
 func CheckoutCommit(repoRoot, commitID string) error {
 	commit, err := objects.GetCommit(repoRoot, commitID)
@@ -530,23 +506,6 @@ func CheckoutCommit(repoRoot, commitID string) error {
 	return nil
 }
 
-// createTreeFromIndex creates a tree from the index (stage 0 entries only).
-func createTreeFromIndex(repoRoot string, index *Index) (string, error) {
-	var entries []objects.TreeEntry
-	for _, entry := range index.Entries {
-		if entry.Stage == 0 {
-			entries = append(entries, objects.TreeEntry{
-				Mode:     entry.Mode,
-				Name:     filepath.Base(entry.FilePath),
-				Hash:     entry.SHA256,
-				Type:     "blob",
-				FullPath: entry.FilePath,
-			})
-		}
-	}
-	return objects.CreateTreeFromEntries(repoRoot, entries)
-}
-
 // updateWorkingDirectory updates the working directory to match the tree.
 func updateWorkingDirectory(repoRoot string, tree *objects.TreeObject) error {
 	for _, entry := range tree.Entries {
@@ -576,15 +535,15 @@ func updateWorkingDirectory(repoRoot string, tree *objects.TreeObject) error {
 }
 
 // createIndexFromTree creates an index from a tree.
-func createIndexFromTree(repoRoot string, tree *objects.TreeObject) (*Index, error) {
-	index := NewIndex(repoRoot)
+func createIndexFromTree(repoRoot string, tree *objects.TreeObject) (*staging.Index, error) {
+	index := staging.NewIndex(repoRoot)
 	for _, entry := range tree.Entries {
 		absPath := filepath.Join(repoRoot, entry.FullPath)
 		stat, err := os.Stat(absPath)
 		if err != nil {
 			return nil, fmt.Errorf("failed to stat '%s': %w", entry.FullPath, err)
 		}
-		indexEntry := IndexEntry{
+		indexEntry := staging.IndexEntry{
 			Mode:     entry.Mode,
 			FilePath: entry.FullPath,
 			SHA256:   entry.Hash,
@@ -595,14 +554,4 @@ func createIndexFromTree(repoRoot string, tree *objects.TreeObject) (*Index, err
 		index.Entries = append(index.Entries, indexEntry)
 	}
 	return index, nil
-}
-
-// isValidHex checks if a string is a valid hexadecimal value.
-func isValidHex(s string) bool {
-	for _, c := range s {
-		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
-			return false
-		}
-	}
-	return true
 }

@@ -5,8 +5,8 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/NahomAnteneh/vec/internal/core"
 	"github.com/NahomAnteneh/vec/internal/objects"
+	"github.com/NahomAnteneh/vec/internal/staging"
 	"github.com/NahomAnteneh/vec/utils"
 	"github.com/spf13/cobra"
 )
@@ -24,7 +24,7 @@ var addCmd = &cobra.Command{
 		}
 
 		// Load the current index (staging area)
-		index, err := core.LoadIndex(repoRoot)
+		index, err := staging.LoadIndex(repoRoot)
 		if err != nil {
 			return fmt.Errorf("failed to load index: %w", err)
 		}
@@ -70,7 +70,7 @@ var addCmd = &cobra.Command{
 }
 
 // addFileOrDir adds a file or directory (recursively) to the index.
-func addFileOrDir(repoRoot string, index *core.Index, absPath string) error {
+func addFileOrDir(repoRoot string, index *staging.Index, absPath string) error {
 	// Convert absolute path to relative path for index storage
 	relPath, err := filepath.Rel(repoRoot, absPath)
 	if err != nil {
