@@ -11,6 +11,10 @@ import (
 	"strings"
 	"time"
 
+	"slices"
+
+	"maps"
+
 	"github.com/NahomAnteneh/vec/internal/objects"
 	"github.com/NahomAnteneh/vec/utils"
 )
@@ -115,7 +119,7 @@ func (i *Index) Add(repoRoot, relPath, hash string) error {
 func (i *Index) Remove(repoRoot, relPath string) error {
 	for j, entry := range i.Entries {
 		if entry.FilePath == relPath && entry.Stage == 0 {
-			i.Entries = append(i.Entries[:j], i.Entries[j+1:]...)
+			i.Entries = slices.Delete(i.Entries, j, j+1)
 			return nil
 		}
 	}
@@ -148,36 +152,59 @@ func (i *Index) GetStagedFiles() []string {
 	return staged
 }
 
-// HasUncommittedChanges checks for uncommitted changes in the working directory or index.
+// buildFileMapFromTree returns a map from relative file paths to blob hashes by traversing the tree recursively.
+func buildFileMapFromTree(repoRoot string, tree *objects.TreeObject, basePath string) (map[string]string, error) {
+	fileMap := make(map[string]string)
+	for _, entry := range tree.Entries {
+		currentPath := filepath.Join(basePath, entry.Name)
+		if entry.Type == "blob" {
+			fileMap[currentPath] = entry.Hash
+		} else if entry.Type == "tree" {
+			subTree, err := objects.GetTree(repoRoot, entry.Hash)
+			if err != nil {
+				return nil, fmt.Errorf("failed to get subtree '%s': %w", entry.Hash, err)
+			}
+			subMap, err := buildFileMapFromTree(repoRoot, subTree, currentPath)
+			if err != nil {
+				return nil, err
+			}
+			// Merge subMap into fileMap
+			maps.Copy(fileMap, subMap)
+		}
+	}
+	return fileMap, nil
+}
+
+// HasUncommittedChanges checks for uncommitted changes for tracked files
+// by comparing the index (stage 0) with the HEAD tree (built recursively) and the working directory.
 func (i *Index) HasUncommittedChanges(repoRoot string) bool {
-	// Get the HEAD commit to compare against
+	// Retrieve the HEAD commit and its tree
 	headCommitID, err := utils.ReadHEAD(repoRoot)
 	if err != nil {
-		return true // Conservatively assume changes if HEAD can't be read
+		return true // Assume changes if HEAD can't be read
 	}
 	var headTree *objects.TreeObject
 	if headCommitID != "" {
 		headCommit, err := objects.GetCommit(repoRoot, headCommitID)
 		if err != nil {
-			return true // Conservatively assume changes if commit can't be loaded
+			return true // Assume changes if commit can't be loaded
 		}
 		headTree, err = objects.GetTree(repoRoot, headCommit.Tree)
 		if err != nil {
-			return true // Conservatively assume changes if tree can't be loaded
+			return true // Assume changes if tree can't be loaded
 		}
 	}
 
-	// Build a map of HEAD tree entries for comparison
+	// Build maps for comparison using the recursive helper
 	headTreeMap := make(map[string]string) // filepath -> hash
 	if headTree != nil {
-		for _, entry := range headTree.Entries {
-			if entry.Type == "blob" {
-				headTreeMap[entry.FullPath] = entry.Hash
-			}
+		m, err := buildFileMapFromTree(repoRoot, headTree, "")
+		if err != nil {
+			return true // Assume changes if unable to build file map
 		}
+		headTreeMap = m
 	}
 
-	// Build a map of stage 0 index entries
 	indexMap := make(map[string]string) // filepath -> hash
 	for _, entry := range i.Entries {
 		if entry.Stage == 0 {
@@ -185,7 +212,7 @@ func (i *Index) HasUncommittedChanges(repoRoot string) bool {
 		}
 	}
 
-	// Check for staged changes (index differs from HEAD)
+	// Check for staged changes (index vs. HEAD)
 	for path, headHash := range headTreeMap {
 		indexHash, exists := indexMap[path]
 		if !exists || indexHash != headHash {
@@ -198,7 +225,7 @@ func (i *Index) HasUncommittedChanges(repoRoot string) bool {
 		}
 	}
 
-	// Check for unstaged changes (working directory differs from index)
+	// Check for unstaged changes (working directory vs. index)
 	for _, entry := range i.Entries {
 		if entry.Stage != 0 {
 			continue // Skip conflict entries
@@ -209,7 +236,7 @@ func (i *Index) HasUncommittedChanges(repoRoot string) bool {
 			return true // File in index but missing in working directory
 		}
 		if err != nil {
-			return true // Conservatively assume changes on stat error
+			return true // Assume changes on stat error
 		}
 		// Check if file has been modified since last indexed
 		if fileInfo.ModTime().After(entry.Mtime) {
@@ -217,40 +244,15 @@ func (i *Index) HasUncommittedChanges(repoRoot string) bool {
 			if err != nil {
 				return true // Assume changes if file can't be read
 			}
-			currentHash := utils.HashBytes("blob", content) // Compute current file hash
+			currentHash := utils.HashBytes("blob", content)
 			if currentHash != entry.SHA256 {
 				return true // Content differs from index
 			}
 		}
 	}
 
-	// Check for untracked files in the working directory
-	err = filepath.Walk(repoRoot, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		if info.IsDir() {
-			if path == filepath.Join(repoRoot, ".vec") {
-				return filepath.SkipDir // Skip .vec directory
-			}
-			return nil
-		}
-		relPath, err := filepath.Rel(repoRoot, path)
-		if err != nil {
-			return err
-		}
-		if _, exists := indexMap[relPath]; !exists {
-			if _, exists := headTreeMap[relPath]; !exists {
-				return fmt.Errorf("untracked file detected") // Break walk with an error
-			}
-		}
-		return nil
-	})
-	if err != nil && err.Error() == "untracked file detected" {
-		return true
-	}
-
-	return false // No uncommitted changes found
+	// No uncommitted changes found
+	return false
 }
 
 // IsClean returns true if there are no uncommitted changes in the working directory or index.
@@ -454,11 +456,11 @@ func CreateTreeFromIndex(repoRoot string, index *Index) (string, error) {
 		}
 		// Create a tree entry for the file (blob).
 		fileEntry := objects.TreeEntry{
-			Mode:     ie.Mode,
-			Name:     parts[len(parts)-1],
-			Hash:     ie.SHA256,
-			Type:     "blob",
-			FullPath: ie.FilePath,
+			Mode: ie.Mode,
+			Name: parts[len(parts)-1],
+			Hash: ie.SHA256,
+			Type: "blob",
+			// FullPath: ie.FilePath,
 		}
 		treeMap[parentDir] = append(treeMap[parentDir], fileEntry)
 	}

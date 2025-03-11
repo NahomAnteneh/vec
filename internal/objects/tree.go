@@ -17,11 +17,11 @@ import (
 
 // TreeEntry represents a single entry in a tree—either a blob (file) or a subtree.
 type TreeEntry struct {
-	Mode     int32  // File mode (e.g., 100644 for files, 040000 for trees)
-	Name     string // Basename (e.g., "file.txt" or directory name)
-	Hash     string // SHA-256 hash (hex string) of the blob or subtree.
-	Type     string // "blob" or "tree"
-	FullPath string // Full relative path (only used when building the map)
+	Mode int32  // File mode (e.g., 100644 for files, 040000 for trees)
+	Name string // Basename (e.g., "file.txt" or directory name)
+	Hash string // SHA-256 hash (hex string) of the blob or subtree.
+	Type string // "blob" or "tree"
+	// FullPath string // Full relative path (only used when building the map)
 }
 
 // TreeObject represents a Git-style tree object.

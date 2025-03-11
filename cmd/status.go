@@ -134,7 +134,8 @@ func compareStatus(repoRoot string, index *staging.Index, commitTree *objects.Tr
 	}
 
 	commitTreeMap := make(map[string]objects.TreeEntry) // path -> TreeEntry
-	buildCommitTreeMap(commitTree, "", commitTreeMap)
+	// Updated call: pass repoRoot to buildCommitTreeMap
+	buildCommitTreeMap(repoRoot, commitTree, "", commitTreeMap)
 
 	// Track files seen in the working directory to detect deletions
 	workingDirFiles := make(map[string]bool)
@@ -234,18 +235,19 @@ func compareStatus(repoRoot string, index *staging.Index, commitTree *objects.Tr
 }
 
 // buildCommitTreeMap recursively builds a map of commit tree entries.
-func buildCommitTreeMap(tree *objects.TreeObject, parentPath string, treeMap map[string]objects.TreeEntry) {
+// Added 'repoRoot' so we can properly load subtrees.
+func buildCommitTreeMap(repoRoot string, tree *objects.TreeObject, parentPath string, treeMap map[string]objects.TreeEntry) {
 	for _, entry := range tree.Entries {
 		entryPath := filepath.Join(parentPath, entry.Name)
 		if entry.Type == "blob" {
 			treeMap[entryPath] = entry
 		} else if entry.Type == "tree" {
-			subTree, err := objects.GetTree("", entry.Hash) // repoRoot not used in GetTree
+			subTree, err := objects.GetTree(repoRoot, entry.Hash)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error getting subtree %s: %v\n", entry.Hash, err)
 				continue
 			}
-			buildCommitTreeMap(subTree, entryPath, treeMap)
+			buildCommitTreeMap(repoRoot, subTree, entryPath, treeMap)
 		}
 	}
 }

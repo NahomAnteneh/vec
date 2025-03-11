@@ -29,10 +29,10 @@ var branchCmd = &cobra.Command{
 		deleteBranch, _ := cmd.Flags().GetString("delete")
 		renameBranch, _ := cmd.Flags().GetString("rename")
 		if list || deleteBranch != "" || renameBranch != "" {
-			return fmt.Errorf("No argument for the defined flag")
+			return fmt.Errorf("no argument for the defined flag")
 		}
 		// Otherwise, create a branch.
-		return createBranch(repoRoot, args[0])
+		return CreateBranch(repoRoot, args[0])
 	},
 }
 
@@ -47,7 +47,7 @@ func listBranches(repoRoot string, cmd *cobra.Command) error {
 	} else if renameBranch != "" {
 		args := strings.Split(renameBranch, " ")
 		if len(args) != 2 {
-			return fmt.Errorf("Rename requires two arguments")
+			return fmt.Errorf("rename requires two arguments")
 		}
 		if err := renameBranchOp(repoRoot, args[0], args[1]); err != nil {
 			return err
@@ -79,7 +79,7 @@ func listBranches(repoRoot string, cmd *cobra.Command) error {
 	return nil
 }
 
-func createBranch(repoRoot string, branchName string) error {
+func CreateBranch(repoRoot string, branchName string) error {
 	// Basic validation of branch name (you might want more robust checks).
 	if strings.ContainsAny(branchName, " /\\~^:?*[]") {
 		return fmt.Errorf("invalid branch name: %s", branchName)

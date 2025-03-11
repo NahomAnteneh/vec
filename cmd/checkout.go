@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,6 +12,10 @@ import (
 	"github.com/NahomAnteneh/vec/internal/staging"
 	"github.com/NahomAnteneh/vec/utils"
 	"github.com/spf13/cobra"
+)
+
+var (
+	createBranch bool
 )
 
 // checkoutCmd defines the "checkout" command for switching branches or commits.
@@ -28,8 +33,10 @@ var checkoutCmd = &cobra.Command{
 }
 
 // checkout switches the working directory and index to the specified branch or commit.
+// When the -b flag is passed, it creates a new branch (using shared branch logic)
+// and then checks it out.
 func checkout(repoRoot, target string) error {
-	// Load index and check for uncommitted changes
+	// Load index and check for uncommitted changes.
 	index, err := staging.LoadIndex(repoRoot)
 	if err != nil {
 		return fmt.Errorf("failed to load index: %w", err)
@@ -38,49 +45,68 @@ func checkout(repoRoot, target string) error {
 		return fmt.Errorf("your local changes would be overwritten by checkout; please commit or stash them first")
 	}
 
-	// Determine if target is a branch or commit
-	var targetCommitID string
 	branchPath := filepath.Join(repoRoot, ".vec", "refs", "heads", target)
 	headFile := filepath.Join(repoRoot, ".vec", "HEAD")
-	isBranch := utils.FileExists(branchPath)
+	var targetCommitID string
+	var isBranch bool
 
-	if isBranch {
-		// Target is a branch
-		commitIDBytes, err := os.ReadFile(branchPath)
-		if err != nil {
-			return fmt.Errorf("failed to read branch file: %w", err)
+	if createBranch {
+		// Use shared branch creation logic.
+		// Make sure the function is exported from branch.go as CreateBranch.
+		if err := CreateBranch(repoRoot, target); err != nil {
+			return fmt.Errorf("failed to create branch '%s': %w", target, err)
 		}
-		targetCommitID = strings.TrimSpace(string(commitIDBytes))
-		// Update HEAD to reference the branch
+		// Update HEAD to reference the new branch.
 		if err := os.WriteFile(headFile, []byte("ref: refs/heads/"+target), 0644); err != nil {
-			return fmt.Errorf("failed to update HEAD to branch: %w", err)
+			return fmt.Errorf("failed to update HEAD to branch '%s': %w", target, err)
 		}
+		// Get the current commit (the branch is created at current HEAD).
+		currentCommitID, err := utils.GetHeadCommit(repoRoot)
+		if err != nil {
+			return fmt.Errorf("failed to get current HEAD commit: %w", err)
+		}
+		targetCommitID = currentCommitID
+		isBranch = true
 	} else {
-		// Target is assumed to be a commit hash (validate later via GetCommit)
-		targetCommitID = target
-		// Update HEAD to point directly to the commit (detached state)
-		if err := os.WriteFile(headFile, []byte(targetCommitID), 0644); err != nil {
-			return fmt.Errorf("failed to update HEAD to commit: %w", err)
+		// Determine if target is an existing branch.
+		isBranch = utils.FileExists(branchPath)
+		if isBranch {
+			commitIDBytes, err := os.ReadFile(branchPath)
+			if err != nil {
+				return fmt.Errorf("failed to read branch file: %w", err)
+			}
+			targetCommitID = strings.TrimSpace(string(commitIDBytes))
+			// Update HEAD to reference the branch.
+			if err := os.WriteFile(headFile, []byte("ref: refs/heads/"+target), 0644); err != nil {
+				return fmt.Errorf("failed to update HEAD to branch '%s': %w", target, err)
+			}
+		} else {
+			// Target is assumed to be a commit hash.
+			targetCommitID = target
+			// Update HEAD to point directly to the commit (detached state).
+			if err := os.WriteFile(headFile, []byte(targetCommitID), 0644); err != nil {
+				return fmt.Errorf("failed to update HEAD to commit '%s': %w", target, err)
+			}
 		}
 	}
 
-	// Load and validate the target commit
+	// Load and validate the target commit.
 	targetCommit, err := objects.GetCommit(repoRoot, targetCommitID)
 	if err != nil {
 		return fmt.Errorf("invalid target '%s': %w", target, err)
 	}
 
-	// Load the target tree
+	// Load the target tree.
 	targetTree, err := objects.GetTree(repoRoot, targetCommit.Tree)
 	if err != nil {
 		return fmt.Errorf("failed to load tree for commit %s: %w", targetCommitID, err)
 	}
 
-	// Update working directory and index
-	if err := updateWorkingDirectory(repoRoot, targetTree); err != nil {
+	// Update working directory and index.
+	if err := updateWorkingDirectory(repoRoot, targetTree, ""); err != nil {
 		return fmt.Errorf("failed to update working directory: %w", err)
 	}
-	newIndex, err := createIndexFromTree(repoRoot, targetTree)
+	newIndex, err := createIndexFromTree(repoRoot, targetTree, "")
 	if err != nil {
 		return fmt.Errorf("failed to update index: %w", err)
 	}
@@ -88,9 +114,13 @@ func checkout(repoRoot, target string) error {
 		return fmt.Errorf("failed to write index: %w", err)
 	}
 
-	// Update reflog
-	prevCommitID, _ := utils.GetHeadCommit(repoRoot) // Ignore error, might be initial state
-	if err := updateReflog(repoRoot, prevCommitID, targetCommitID, target, "checkout", "moving to "+target); err != nil {
+	// Update reflog.
+	prevCommitID, _ := utils.GetHeadCommit(repoRoot) // May be empty on initial checkout.
+	refName := "(HEAD detached)"
+	if isBranch {
+		refName = target
+	}
+	if err := updateReflog(repoRoot, prevCommitID, targetCommitID, refName, "checkout", "moving to "+target); err != nil {
 		return fmt.Errorf("failed to update reflog: %w", err)
 	}
 
@@ -98,22 +128,21 @@ func checkout(repoRoot, target string) error {
 	return nil
 }
 
-// updateWorkingDirectory updates the working directory to match the specified tree.
-func updateWorkingDirectory(repoRoot string, tree *objects.TreeObject) error {
-	// Build a map of all current files in the working directory
+// The functions updateWorkingDirectory, getWorkingDirFiles, collectTreeEntries,
+// collectTreeDirectories, removeExtraDirectories, createIndexFromTree, and updateReflog
+// remain unchanged.
+func updateWorkingDirectory(repoRoot string, tree *objects.TreeObject, basePath string) error {
 	currentFiles, err := getWorkingDirFiles(repoRoot)
 	if err != nil {
 		return fmt.Errorf("failed to scan working directory: %w", err)
 	}
 
-	// Build a map of tree entries
 	treeFiles := make(map[string]objects.TreeEntry)
-	collectTreeEntries(tree, "", treeFiles)
+	collectTreeEntries(repoRoot, tree, basePath, treeFiles)
 
-	// Update or add files from the tree
 	for relPath, entry := range treeFiles {
 		if entry.Type != "blob" {
-			continue // Skip non-blob entries (subtrees handled recursively)
+			continue
 		}
 		absPath := filepath.Join(repoRoot, relPath)
 		blobContent, err := objects.GetBlob(repoRoot, entry.Hash)
@@ -126,36 +155,46 @@ func updateWorkingDirectory(repoRoot string, tree *objects.TreeObject) error {
 		if err := os.WriteFile(absPath, blobContent, os.FileMode(entry.Mode)); err != nil {
 			return fmt.Errorf("failed to write file %s: %w", relPath, err)
 		}
-		delete(currentFiles, absPath) // Remove from current files as it’s handled
+		delete(currentFiles, relPath)
 	}
 
-	// Remove files not present in the target tree
-	for absPath := range currentFiles {
-		if err := os.Remove(absPath); err != nil {
-			return fmt.Errorf("failed to remove file %s: %w", absPath, err)
+	for relPath := range currentFiles {
+		absPath := filepath.Join(repoRoot, relPath)
+		if err := os.RemoveAll(absPath); err != nil {
+			return fmt.Errorf("failed to remove file %s: %w", relPath, err)
 		}
+	}
+
+	validDirs := make(map[string]struct{})
+	collectTreeDirectories(repoRoot, tree, basePath, validDirs)
+	if err := removeExtraDirectories(repoRoot, validDirs); err != nil {
+		return fmt.Errorf("failed to remove extra directories: %w", err)
 	}
 
 	return nil
 }
 
-// getWorkingDirFiles returns a map of all files in the working directory, excluding ignored paths.
 func getWorkingDirFiles(repoRoot string) (map[string]struct{}, error) {
 	files := make(map[string]struct{})
 	err := filepath.Walk(repoRoot, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
+		if info.IsDir() && path == filepath.Join(repoRoot, ".vec") {
+			return filepath.SkipDir
+		}
 		if info.IsDir() {
-			if path == filepath.Join(repoRoot, ".vec") {
-				return filepath.SkipDir
-			}
 			return nil
 		}
-		if isIgnored, _ := utils.IsIgnored(repoRoot, path); isIgnored {
+		isIgnored, _ := utils.IsIgnored(repoRoot, path)
+		if isIgnored {
 			return nil
 		}
-		files[path] = struct{}{}
+		rel, err := filepath.Rel(repoRoot, path)
+		if err != nil {
+			return err
+		}
+		files[rel] = struct{}{}
 		return nil
 	})
 	if err != nil {
@@ -164,27 +203,76 @@ func getWorkingDirFiles(repoRoot string) (map[string]struct{}, error) {
 	return files, nil
 }
 
-// collectTreeEntries recursively builds a map of tree entries with full relative paths.
-func collectTreeEntries(tree *objects.TreeObject, prefix string, entries map[string]objects.TreeEntry) {
+func collectTreeEntries(repoRoot string, tree *objects.TreeObject, prefix string, entries map[string]objects.TreeEntry) {
 	for _, entry := range tree.Entries {
 		fullPath := filepath.Join(prefix, entry.Name)
 		if entry.Type == "blob" {
 			entries[fullPath] = entry
 		} else if entry.Type == "tree" {
-			subTree, err := objects.GetTree("", entry.Hash) // Empty repoRoot for relative lookup; adjust if needed
+			subTree, err := objects.GetTree(repoRoot, entry.Hash)
 			if err != nil {
-				return // Errors handled by caller
+				fmt.Fprintf(os.Stderr, "Error getting subtree %s: %v\n", entry.Hash, err)
+				continue
 			}
-			collectTreeEntries(subTree, fullPath, entries)
+			collectTreeEntries(repoRoot, subTree, fullPath, entries)
 		}
 	}
 }
 
-// createIndexFromTree creates a new index from the specified tree.
-func createIndexFromTree(repoRoot string, tree *objects.TreeObject) (*staging.Index, error) {
+func collectTreeDirectories(repoRoot string, tree *objects.TreeObject, prefix string, dirs map[string]struct{}) {
+	for _, entry := range tree.Entries {
+		fullPath := filepath.Join(prefix, entry.Name)
+		if entry.Type == "tree" {
+			dirs[fullPath] = struct{}{}
+			subTree, err := objects.GetTree(repoRoot, entry.Hash)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error getting subtree %s: %v\n", entry.Hash, err)
+				continue
+			}
+			collectTreeDirectories(repoRoot, subTree, fullPath, dirs)
+		}
+	}
+}
+
+func removeExtraDirectories(repoRoot string, validDirs map[string]struct{}) error {
+	return filepath.Walk(repoRoot, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(repoRoot, path)
+		if err != nil {
+			return err
+		}
+		if rel == "." || rel == ".vec" {
+			return nil
+		}
+		if _, ok := validDirs[rel]; !ok {
+			f, err := os.Open(path)
+			if err != nil {
+				return err
+			}
+			names, err := f.Readdirnames(1)
+			f.Close()
+			if err != nil && err != io.EOF {
+				return err
+			}
+			if len(names) == 0 {
+				if err := os.Remove(path); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	})
+}
+
+func createIndexFromTree(repoRoot string, tree *objects.TreeObject, basePath string) (*staging.Index, error) {
 	index := staging.NewIndex(repoRoot)
 	treeFiles := make(map[string]objects.TreeEntry)
-	collectTreeEntries(tree, "", treeFiles)
+	collectTreeEntries(repoRoot, tree, basePath, treeFiles)
 
 	for relPath, entry := range treeFiles {
 		if entry.Type != "blob" {
@@ -207,9 +295,7 @@ func createIndexFromTree(repoRoot string, tree *objects.TreeObject) (*staging.In
 	return index, nil
 }
 
-// updateReflog logs an action (e.g., checkout, commit) in the reflog for HEAD and, if applicable, a branch.
 func updateReflog(repoRoot, prevCommitID, newCommitID, ref, action, details string) error {
-	// Retrieve author/committer info from config
 	authorName, err := utils.GetConfigValue(repoRoot, "user.name")
 	if err != nil || authorName == "" {
 		authorName = "unknown"
@@ -220,12 +306,10 @@ func updateReflog(repoRoot, prevCommitID, newCommitID, ref, action, details stri
 	}
 	author := fmt.Sprintf("%s <%s>", authorName, authorEmail)
 
-	// Handle initial state (no previous commit)
 	if prevCommitID == "" {
-		prevCommitID = "0000000000000000000000000000000000000000000000000000000000000000" // Zero hash
+		prevCommitID = "0000000000000000000000000000000000000000000000000000000000000000"
 	}
 
-	// Construct reflog entry
 	timestamp := time.Now().Unix()
 	var entry string
 	if details != "" {
@@ -234,7 +318,6 @@ func updateReflog(repoRoot, prevCommitID, newCommitID, ref, action, details stri
 		entry = fmt.Sprintf("%s %s %s %d\t%s\n", prevCommitID, newCommitID, author, timestamp, action)
 	}
 
-	// Update HEAD reflog
 	headReflogPath := filepath.Join(repoRoot, ".vec", "logs", "HEAD")
 	f, err := os.OpenFile(headReflogPath, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0644)
 	if err != nil {
@@ -245,7 +328,6 @@ func updateReflog(repoRoot, prevCommitID, newCommitID, ref, action, details stri
 		return fmt.Errorf("failed to write to HEAD reflog: %w", err)
 	}
 
-	// Update branch reflog if ref is a branch
 	if ref != "(HEAD detached)" && ref != "" {
 		branchReflogPath := filepath.Join(repoRoot, ".vec", "logs", "refs", "heads", ref)
 		if err := utils.EnsureDirExists(filepath.Dir(branchReflogPath)); err != nil {
@@ -264,7 +346,7 @@ func updateReflog(repoRoot, prevCommitID, newCommitID, ref, action, details stri
 	return nil
 }
 
-// init registers the checkout command with the root command.
 func init() {
 	rootCmd.AddCommand(checkoutCmd)
+	checkoutCmd.Flags().BoolVarP(&createBranch, "branch", "b", false, "Create a new branch and switch to it")
 }

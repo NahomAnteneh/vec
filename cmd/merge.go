@@ -8,6 +8,11 @@ import (
 	"github.com/spf13/cobra"
 )
 
+var (
+	mergeStrategy string
+	interactive   bool
+)
+
 // mergeCmd defines the "merge" command for the vec CLI.
 var mergeCmd = &cobra.Command{
 	Use:   "merge <branch>",
@@ -18,33 +23,38 @@ otherwise, handling conflicts by marking them in the working directory and index
 Resolve conflicts manually and commit the result to complete the merge.`,
 	Args: cobra.ExactArgs(1), // Requires exactly one argument: the branch to merge from
 	RunE: func(cmd *cobra.Command, args []string) error {
-		// Get the repository root
+		// Get the repository root.
 		repoRoot, err := utils.GetVecRoot()
 		if err != nil {
 			return fmt.Errorf("failed to find repository root: %w", err)
 		}
 
-		// Get the source branch from arguments
+		// Get the source branch from arguments.
 		sourceBranch := args[0]
 
-		// Perform the merge
-		hasConflicts, err := merge.Merge(repoRoot, sourceBranch)
+		// Build merge configuration based on flags.
+		config := &merge.MergeConfig{
+			Strategy:    merge.MergeStrategy(mergeStrategy),
+			Interactive: interactive,
+		}
+
+		// Perform the merge.
+		hasConflicts, err := merge.Merge(repoRoot, sourceBranch, config)
 		if err != nil {
 			return fmt.Errorf("merge failed: %w", err)
 		}
 
-		// Provide feedback based on merge outcome
+		// Provide feedback based on merge outcome.
 		if hasConflicts {
 			fmt.Println("Merge encountered conflicts. Resolve them and run 'vec commit' to complete the merge.")
-		} else {
-			// Success message is already printed by core.Merge (e.g., "Fast-forward merge completed" or "Merge completed successfully")
 		}
 
 		return nil
 	},
 }
 
-// init registers the merge command with the root command.
 func init() {
 	rootCmd.AddCommand(mergeCmd)
+	mergeCmd.Flags().StringVarP(&mergeStrategy, "strategy", "s", "recursive", "Merge strategy to use (recursive, ours, theirs)")
+	mergeCmd.Flags().BoolVarP(&interactive, "interactive", "i", false, "Prompt interactively to resolve conflicts")
 }

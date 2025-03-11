@@ -172,7 +172,7 @@ func getObjectType(content []byte) (string, error) {
 
 // printCommit displays a commit object in a human-readable format.
 func printCommit(commit *objects.Commit) {
-	fmt.Printf("tree %s\n", commit.Tree)
+	fmt.Printf("tree  %s\n", commit.Tree)
 	for _, parent := range commit.Parents {
 		fmt.Printf("parent %s\n", parent)
 	}
