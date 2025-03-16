@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/NahomAnteneh/vec/internal/config"
 	"github.com/NahomAnteneh/vec/utils"
 	"github.com/spf13/cobra"
 )
@@ -110,18 +111,92 @@ var unsetCmd = &cobra.Command{
 	},
 }
 
+// remoteAuthCmd adds authentication token to a remote repository
+var remoteAuthCmd = &cobra.Command{
+	Use:   "remote.auth <remote-name> <token>",
+	Short: "Set authentication token for a remote",
+	Args:  cobra.ExactArgs(2),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		repoRoot, err := utils.GetVecRoot()
+		if err != nil {
+			return err
+		}
+
+		remoteName := args[0]
+		authToken := args[1]
+
+		cfg, err := config.LoadConfig(repoRoot)
+		if err != nil {
+			return fmt.Errorf("failed to load config: %v", err)
+		}
+
+		if err := cfg.SetRemoteAuth(remoteName, authToken); err != nil {
+			return err
+		}
+
+		if err := cfg.Write(); err != nil {
+			return fmt.Errorf("failed to save config: %v", err)
+		}
+
+		fmt.Printf("Set auth token for remote '%s'\n", remoteName)
+		return nil
+	},
+}
+
+// remoteHeaderCmd adds a custom HTTP header to a remote repository
+var remoteHeaderCmd = &cobra.Command{
+	Use:   "remote.header <remote-name> <header-name> <header-value>",
+	Short: "Set custom HTTP header for a remote",
+	Args:  cobra.ExactArgs(3),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		repoRoot, err := utils.GetVecRoot()
+		if err != nil {
+			return err
+		}
+
+		remoteName := args[0]
+		headerName := args[1]
+		headerValue := args[2]
+
+		cfg, err := config.LoadConfig(repoRoot)
+		if err != nil {
+			return fmt.Errorf("failed to load config: %v", err)
+		}
+
+		// For Authorization header specifically
+		if strings.EqualFold(headerName, "Authorization") {
+			if err := cfg.SetRemoteAuth(remoteName, headerValue); err != nil {
+				return err
+			}
+		} else {
+			if err := cfg.SetRemoteHeader(remoteName, headerName, headerValue); err != nil {
+				return err
+			}
+		}
+
+		if err := cfg.Write(); err != nil {
+			return fmt.Errorf("failed to save config: %v", err)
+		}
+
+		fmt.Printf("Set header '%s' for remote '%s'\n", headerName, remoteName)
+		return nil
+	},
+}
+
 func init() {
 	rootCmd.AddCommand(configCmd)
 	configCmd.AddCommand(listCmd)
 	configCmd.AddCommand(getCmd)
 	configCmd.AddCommand(unsetCmd)
+	configCmd.AddCommand(remoteAuthCmd)
+	configCmd.AddCommand(remoteHeaderCmd)
 
 	// Add the --global flag to configCmd
 	configCmd.PersistentFlags().BoolP("global", "g", false, "Use global config file")
 
 	// Nested command to set user.name
 	configCmd.AddCommand(&cobra.Command{
-		Use:   "user.name <name>",
+		Use:   "user.name <n>",
 		Short: "Set the user's name",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {

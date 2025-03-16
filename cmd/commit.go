@@ -56,11 +56,32 @@ func commit(repoRoot, message string) error {
 
 	// Prompt for commit message if not provided
 	if message == "" {
-		fmt.Print("Enter commit message: ")
-		reader := bufio.NewReader(os.Stdin)
-		message, err = reader.ReadString('\n')
-		if err != nil || strings.TrimSpace(message) == "" {
-			return fmt.Errorf("aborting commit due to empty message")
+		// Try up to 3 times to get a non-empty message
+		for attempts := 0; attempts < 3; attempts++ {
+			if attempts == 0 {
+				fmt.Print("Enter commit message: ")
+			} else {
+				fmt.Print("Commit message cannot be empty. Please try again: ")
+			}
+
+			reader := bufio.NewReader(os.Stdin)
+			message, err = reader.ReadString('\n')
+
+			// Check for read error
+			if err != nil {
+				return fmt.Errorf("error reading commit message: %w", err)
+			}
+
+			// Check if message is non-empty after trimming
+			if trimmedMsg := strings.TrimSpace(message); trimmedMsg != "" {
+				message = trimmedMsg
+				break
+			}
+
+			// If we've reached the last attempt and still no message
+			if attempts == 2 {
+				return fmt.Errorf("aborting commit due to empty message")
+			}
 		}
 	}
 	message = strings.TrimSpace(message)

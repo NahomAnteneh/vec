@@ -15,7 +15,8 @@ import (
 )
 
 var (
-	createBranch bool
+	createBranch  bool
+	forceCheckout bool
 )
 
 // checkoutCmd defines the "checkout" command for switching branches or commits.
@@ -41,8 +42,8 @@ func checkout(repoRoot, target string) error {
 	if err != nil {
 		return fmt.Errorf("failed to load index: %w", err)
 	}
-	if !index.IsClean(repoRoot) {
-		return fmt.Errorf("your local changes would be overwritten by checkout; please commit or stash them first")
+	if !index.IsClean(repoRoot) && !forceCheckout {
+		return fmt.Errorf("your local changes would be overwritten by checkout; please commit or stash them first (or use --force to discard changes)")
 	}
 
 	branchPath := filepath.Join(repoRoot, ".vec", "refs", "heads", target)
@@ -349,4 +350,5 @@ func updateReflog(repoRoot, prevCommitID, newCommitID, ref, action, details stri
 func init() {
 	rootCmd.AddCommand(checkoutCmd)
 	checkoutCmd.Flags().BoolVarP(&createBranch, "branch", "b", false, "Create a new branch and switch to it")
+	checkoutCmd.Flags().BoolVarP(&forceCheckout, "force", "f", false, "Discard local changes and switch to the specified branch or commit")
 }

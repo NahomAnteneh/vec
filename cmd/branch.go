@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/NahomAnteneh/vec/internal/objects"
 	"github.com/NahomAnteneh/vec/utils"
 	"github.com/spf13/cobra"
 )
@@ -37,11 +38,12 @@ var branchCmd = &cobra.Command{
 }
 
 func listBranches(repoRoot string, cmd *cobra.Command) error {
-	list, _ := cmd.Flags().GetBool("list")
+	// Get flag values
 	deleteBranch, _ := cmd.Flags().GetString("delete")
 	renameBranch, _ := cmd.Flags().GetString("rename")
+	force, _ := cmd.Flags().GetBool("force")
 	if deleteBranch != "" { // Delete branch
-		if err := deleteBranchOp(repoRoot, deleteBranch); err != nil {
+		if err := deleteBranchOp(repoRoot, deleteBranch, force); err != nil {
 			return err
 		}
 	} else if renameBranch != "" {
@@ -52,7 +54,7 @@ func listBranches(repoRoot string, cmd *cobra.Command) error {
 		if err := renameBranchOp(repoRoot, args[0], args[1]); err != nil {
 			return err
 		}
-	} else if len(renameBranch) == 0 && len(deleteBranch) == 0 && list || len(renameBranch) == 0 && len(deleteBranch) == 0 { // List branches.
+	} else { // List branches (default behavior)
 		branchDir := filepath.Join(repoRoot, ".vec", "refs", "heads")
 		entries, err := os.ReadDir(branchDir)
 		if err != nil {
@@ -108,7 +110,7 @@ func CreateBranch(repoRoot string, branchName string) error {
 	return nil
 }
 
-func deleteBranchOp(repoRoot, branchName string) error {
+func deleteBranchOp(repoRoot, branchName string, force bool) error {
 	branchPath := filepath.Join(repoRoot, ".vec", "refs", "heads", branchName)
 
 	//Check if branch exists
@@ -125,7 +127,31 @@ func deleteBranchOp(repoRoot, branchName string) error {
 		return fmt.Errorf("cannot delete the currently checked-out branch '%s'", branchName)
 	}
 
-	//TODO: check if the branch is fully merged
+	// Check if the branch is fully merged
+	if !force {
+		// Get the commit hash that the branch points to
+		branchCommitBytes, err := os.ReadFile(branchPath)
+		if err != nil {
+			return fmt.Errorf("failed to read branch file: %w", err)
+		}
+		branchCommit := strings.TrimSpace(string(branchCommitBytes))
+
+		// Get the commit hash of the current branch
+		currentCommit, err := utils.GetHeadCommit(repoRoot)
+		if err != nil {
+			return fmt.Errorf("failed to get current commit: %w", err)
+		}
+
+		// Check if the branch commit is an ancestor of the current commit
+		isMerged, err := isAncestor(repoRoot, branchCommit, currentCommit)
+		if err != nil {
+			return fmt.Errorf("failed to check if branch is merged: %w", err)
+		}
+
+		if !isMerged {
+			return fmt.Errorf("branch '%s' is not fully merged. Use --force to delete anyway", branchName)
+		}
+	}
 
 	// Delete the branch file
 	if err := os.Remove(branchPath); err != nil {
@@ -159,9 +185,56 @@ func renameBranchOp(repoRoot, oldName, newName string) error {
 	return nil
 }
 
+// IsAncestor checks if potentialAncestor is an ancestor of potentialDescendant
+// Returns true if potentialAncestor is an ancestor of potentialDescendant, false otherwise
+func isAncestor(repoRoot, potentialAncestor, potentialDescendant string) (bool, error) {
+	// If they're the same commit, return true
+	if potentialAncestor == potentialDescendant {
+		return true, nil
+	}
+
+	// Get the descendant commit
+	commit, err := objects.GetCommit(repoRoot, potentialDescendant)
+	if err != nil {
+		return false, fmt.Errorf("failed to get descendant commit: %w", err)
+	}
+
+	// BFS to find the ancestor
+	visited := make(map[string]bool)
+	queue := commit.Parents
+
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+
+		// Skip if already visited
+		if visited[current] {
+			continue
+		}
+		visited[current] = true
+
+		// Check if this is the ancestor we're looking for
+		if current == potentialAncestor {
+			return true, nil
+		}
+
+		// Get the current commit's parents and add them to the queue
+		currentCommit, err := objects.GetCommit(repoRoot, current)
+		if err != nil {
+			return false, fmt.Errorf("failed to get commit %s: %w", current, err)
+		}
+
+		queue = append(queue, currentCommit.Parents...)
+	}
+
+	// If we've traversed all reachable commits and haven't found the ancestor, return false
+	return false, nil
+}
+
 func init() {
 	rootCmd.AddCommand(branchCmd)
 	branchCmd.Flags().BoolP("list", "l", false, "List all branches")
 	branchCmd.Flags().StringP("delete", "d", "", "Delete a branch")
 	branchCmd.Flags().StringP("rename", "m", "", "Rename a branch")
+	branchCmd.Flags().BoolP("force", "f", false, "Force deletion of unmerged branches")
 }

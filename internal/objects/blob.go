@@ -1,4 +1,3 @@
-// internal/objects/blob.go
 package objects
 
 import (

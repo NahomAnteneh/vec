@@ -32,7 +32,9 @@ var addCmd = &cobra.Command{
 		// Process each argument provided by the user
 		for _, arg := range args {
 			// Resolve argument to an absolute path
-			absPath, err := filepath.Abs(filepath.Join(repoRoot, arg))
+			wd, _ := os.Getwd()
+			relPath, _ := filepath.Rel(repoRoot, filepath.Join(wd, arg))
+			absPath, err := filepath.Abs(filepath.Join(repoRoot, relPath))
 			if err != nil {
 				return fmt.Errorf("failed to resolve path '%s': %w", arg, err)
 			}
@@ -41,7 +43,10 @@ var addCmd = &cobra.Command{
 			if _, err := os.Stat(absPath); os.IsNotExist(err) {
 				// If it doesn't exist, treat it as a potential glob pattern
 				files, err := filepath.Glob(absPath)
-				if err != nil || len(files) == 0 {
+				if err != nil {
+					return fmt.Errorf("invalid glob pattern '%s': %w", arg, err)
+				}
+				if len(files) == 0 {
 					fmt.Fprintf(os.Stderr, "warning: pathspec '%s' did not match any files\n", arg)
 					continue // Skip to the next argument
 				}

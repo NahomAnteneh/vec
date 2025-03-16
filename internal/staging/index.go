@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"slices"
@@ -21,8 +22,9 @@ import (
 
 // Index represents the staging area (index) in the repository.
 type Index struct {
-	Entries []IndexEntry // List of entries in the index
-	Path    string       // Path to the index file (e.g., .vec/index)
+	Entries  []IndexEntry // List of entries in the index
+	Path     string       // Path to the index file (e.g., .vec/index)
+	entryMap map[string]*IndexEntry
 }
 
 // IndexEntry represents a single entry in the index.
@@ -427,42 +429,21 @@ func CreateTreeFromIndex(repoRoot string, index *Index) (string, error) {
 		return "", fmt.Errorf("repository root cannot be empty")
 	}
 
+	if index == nil {
+		return "", fmt.Errorf("index cannot be nil")
+	}
+
 	// Build a map: directory path -> list of TreeEntry
 	// Keys are full relative paths for directories.
-	treeMap := make(map[string][]objects.TreeEntry)
+	treeMap, err := buildTreeMapFromIndex(index)
+	if err != nil {
+		return "", fmt.Errorf("failed to build tree map from index: %w", err)
+	}
 
-	// Process each stage-0 index entry.
-	for _, ie := range index.Entries {
-		if ie.Stage != 0 {
-			continue
-		}
-		// ie.FilePath should be a relative path like "a/b/c.txt".
-		if ie.FilePath == "" {
-			return "", fmt.Errorf("index entry for file with hash '%s' has empty FilePath", ie.SHA256)
-		}
-		// Ensure every intermediate directory is present.
-		parts := strings.Split(ie.FilePath, string(filepath.Separator))
-		for i := 1; i < len(parts); i++ {
-			dirKey := filepath.Join(parts[:i]...)
-			if _, exists := treeMap[dirKey]; !exists {
-				// Create empty slice for directory so that recursion will pick it up.
-				treeMap[dirKey] = []objects.TreeEntry{}
-			}
-		}
-		// Determine parent directory.
-		parentDir := filepath.Dir(ie.FilePath)
-		if parentDir == "." {
-			parentDir = ""
-		}
-		// Create a tree entry for the file (blob).
-		fileEntry := objects.TreeEntry{
-			Mode: ie.Mode,
-			Name: parts[len(parts)-1],
-			Hash: ie.SHA256,
-			Type: "blob",
-			// FullPath: ie.FilePath,
-		}
-		treeMap[parentDir] = append(treeMap[parentDir], fileEntry)
+	// If the index is empty, create an empty tree
+	if len(treeMap) == 0 {
+		emptyTreeEntries := []objects.TreeEntry{}
+		return objects.CreateTreeObject(emptyTreeEntries)
 	}
 
 	// Build the hierarchical tree starting at the root ("").
@@ -472,20 +453,456 @@ func CreateTreeFromIndex(repoRoot string, index *Index) (string, error) {
 	}
 
 	// Create and write the root tree object.
-	return objects.CreateTreeObject(repoRoot, rootEntries)
+	rootTreeHash, err := objects.CreateTreeObject(rootEntries)
+	if err != nil {
+		return "", fmt.Errorf("failed to create root tree object: %w", err)
+	}
+
+	return rootTreeHash, nil
 }
 
-// // Write serializes the index entries and writes them to the index file.
-// func (i *Index) Write() error {
-// 	// Serialize the index entries into a binary format
-// 	data, err := i.serialize()
-// 	if err != nil {
-// 		return fmt.Errorf("failed to serialize index: %w", err)
-// 	}
+// buildTreeMapFromIndex constructs a mapping of directory paths to TreeEntry objects
+// from the index entries. This is a helper function for CreateTreeFromIndex.
+// This optimized version pre-allocates memory for the map based on index size
+// and uses a more efficient algorithm for path normalization.
+func buildTreeMapFromIndex(index *Index) (map[string][]objects.TreeEntry, error) {
+	// Pre-allocate the map based on the size of the index
+	// with a reasonable size estimate to avoid frequent resizing
+	estimatedSize := len(index.Entries) / 2
+	if estimatedSize == 0 {
+		estimatedSize = 10 // Reasonable minimum to avoid empty map allocations
+	}
+	treeMap := make(map[string][]objects.TreeEntry, estimatedSize)
 
-// 	// Write the serialized data to the index file
-// 	if err := os.WriteFile(i.Path, data, 0644); err != nil {
-// 		return fmt.Errorf("failed to write index file at %s: %w", i.Path, err)
-// 	}
-// 	return nil
-// }
+	// Track seen directories to avoid redundant operations
+	seenDirs := make(map[string]struct{}, estimatedSize)
+
+	// Process each stage-0 index entry.
+	for _, ie := range index.Entries {
+		if ie.Stage != 0 {
+			continue
+		}
+
+		// Validate the entry's FilePath
+		if ie.FilePath == "" {
+			return nil, fmt.Errorf("index entry for file with hash '%s' has empty FilePath", ie.SHA256)
+		}
+
+		// Normalize the file path to use standard separators - more efficiently
+		normalizedPath := strings.ReplaceAll(ie.FilePath, string(filepath.Separator), "/")
+
+		// Get the parent directory and file name
+		parentDir, fileName := splitPath(normalizedPath)
+
+		// Add the file entry to its parent directory
+		// Use slice pre-allocation when possible
+		fileEntry := objects.TreeEntry{
+			Mode: ie.Mode,
+			Name: fileName,
+			Hash: ie.SHA256,
+			Type: "blob",
+		}
+
+		treeMap[parentDir] = append(treeMap[parentDir], fileEntry)
+
+		// Ensure all parent directories exist in the tree map
+		// but only if we haven't processed this directory before
+		if _, exists := seenDirs[parentDir]; !exists {
+			ensureParentDirectories(treeMap, parentDir)
+			seenDirs[parentDir] = struct{}{}
+		}
+	}
+
+	// Sort entries in each directory for consistency (Git sorts entries by name)
+	// Use an optimized version of the sorting function
+	sortTreeMapEntries(treeMap)
+
+	return treeMap, nil
+}
+
+// splitPath splits a file path into its parent directory and file name.
+// For root-level files, the parent directory is an empty string.
+// Optimized version that avoids creating substrings when possible.
+func splitPath(path string) (string, string) {
+	if path == "" {
+		return "", ""
+	}
+
+	lastSlashIndex := strings.LastIndex(path, "/")
+	if lastSlashIndex == -1 {
+		// File is at the root level
+		return "", path
+	}
+
+	parentDir := path[:lastSlashIndex]
+	fileName := path[lastSlashIndex+1:]
+
+	return parentDir, fileName
+}
+
+// ensureParentDirectories makes sure all parent directories of a path exist in the tree map.
+// This optimized version reduces path splitting operations and uses a more efficient algorithm.
+func ensureParentDirectories(treeMap map[string][]objects.TreeEntry, path string) {
+	if path == "" {
+		return // We've reached the root
+	}
+
+	// More efficient path processing to avoid repeated splits
+	parts := strings.Split(path, "/")
+
+	// Build up paths and ensure directories exist
+	var currentPath string
+	for i := 0; i < len(parts); i++ {
+		if i > 0 {
+			currentPath += "/"
+		}
+		currentPath += parts[i]
+
+		// Only create an entry if it doesn't already exist
+		if _, exists := treeMap[currentPath]; !exists {
+			treeMap[currentPath] = make([]objects.TreeEntry, 0, 4) // Pre-allocate with small capacity
+		}
+	}
+}
+
+// sortTreeMapEntries sorts all entries in the tree map by name for consistent output.
+// This optimized version avoids unnecessary re-sorting of already sorted entries.
+func sortTreeMapEntries(treeMap map[string][]objects.TreeEntry) {
+	for dir, entries := range treeMap {
+		if len(entries) > 1 {
+			// Check if entries are already sorted to avoid unnecessary sort operations
+			needsSort := false
+			for i := 1; i < len(entries); i++ {
+				if entries[i-1].Name > entries[i].Name {
+					needsSort = true
+					break
+				}
+			}
+
+			if needsSort {
+				sort.Slice(entries, func(i, j int) bool {
+					return entries[i].Name < entries[j].Name
+				})
+				treeMap[dir] = entries
+			}
+		}
+	}
+}
+
+// WriteStagedFiles writes the staged files (stage 0 entries) to the working directory.
+// This optimized version uses batched operations and parallel processing for better performance.
+func (i *Index) WriteStagedFiles(repoRoot string) error {
+	if len(i.Entries) == 0 {
+		return nil // Nothing to do
+	}
+
+	// Use a semaphore to limit concurrency
+	const maxConcurrency = 8
+	sem := make(chan struct{}, maxConcurrency)
+
+	// Create a channel for errors
+	errChan := make(chan error, len(i.Entries))
+
+	// First collect directories to create
+	dirs := make(map[string]struct{})
+	for _, entry := range i.Entries {
+		if entry.Stage != 0 {
+			continue
+		}
+		absPath := filepath.Join(repoRoot, entry.FilePath)
+		dirs[filepath.Dir(absPath)] = struct{}{}
+	}
+
+	// Create all directories in a single pass (more efficient than creating them one by one)
+	for dir := range dirs {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return fmt.Errorf("failed to create directory %s: %w", dir, err)
+		}
+	}
+
+	// Create a wait group to track completion
+	var wg sync.WaitGroup
+
+	// Process files in parallel with a semaphore for concurrency control
+	for _, entry := range i.Entries {
+		if entry.Stage != 0 {
+			continue
+		}
+
+		wg.Add(1)
+		sem <- struct{}{} // Acquire semaphore
+
+		go func(entry IndexEntry) {
+			defer wg.Done()
+			defer func() { <-sem }() // Release semaphore when done
+
+			// Get the blob object for this entry
+			blobContent, err := objects.GetBlob(repoRoot, entry.SHA256)
+			if err != nil {
+				errChan <- fmt.Errorf("failed to get blob for %s: %w", entry.FilePath, err)
+				return
+			}
+
+			// Write file content
+			absPath := filepath.Join(repoRoot, entry.FilePath)
+			if err := os.WriteFile(absPath, blobContent, 0644); err != nil {
+				errChan <- fmt.Errorf("failed to write file %s: %w", entry.FilePath, err)
+				return
+			}
+
+			// Set file mode if executable
+			if entry.Mode == 100755 {
+				if err := os.Chmod(absPath, 0755); err != nil {
+					errChan <- fmt.Errorf("failed to set execute permission on %s: %w", entry.FilePath, err)
+					return
+				}
+			}
+		}(entry)
+	}
+
+	// Wait for all operations to complete
+	wg.Wait()
+	close(errChan)
+
+	// Check for any errors
+	for err := range errChan {
+		if err != nil {
+			return err // Return the first error encountered
+		}
+	}
+
+	return nil
+}
+
+// GetEntry returns the index entry for a given file path and stage.
+// If the entry doesn't exist, it returns nil and false.
+// This optimized version uses a map lookup when possible.
+func (i *Index) GetEntry(filePath string, stage int) (*IndexEntry, bool) {
+	// First try to find the entry using the cached map if available
+	if i.entryMap != nil {
+		key := fmt.Sprintf("%s:%d", filePath, stage)
+		if entry, ok := i.entryMap[key]; ok {
+			return entry, true
+		}
+		return nil, false
+	}
+
+	// Fall back to linear search if no map is available
+	for j := range i.Entries {
+		if i.Entries[j].FilePath == filePath && i.Entries[j].Stage == stage {
+			return &i.Entries[j], true
+		}
+	}
+	return nil, false
+}
+
+// buildEntryMap builds an internal map for fast entry lookups
+// This is called lazily when needed
+func (i *Index) buildEntryMap() {
+	i.entryMap = make(map[string]*IndexEntry, len(i.Entries))
+	for j := range i.Entries {
+		key := fmt.Sprintf("%s:%d", i.Entries[j].FilePath, i.Entries[j].Stage)
+		i.entryMap[key] = &i.Entries[j]
+	}
+}
+
+// HasConflicts returns true if the index contains entries with stages 1, 2, or 3,
+// indicating unresolved merge conflicts.
+// This optimized version uses early returns for better performance.
+func (i *Index) HasConflicts() bool {
+	for _, entry := range i.Entries {
+		if entry.Stage > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// GetConflicts returns all files that have conflicts (entries with stages 1, 2, or 3)
+// This is a new helper function to efficiently find conflicts
+func (i *Index) GetConflicts() map[string]bool {
+	conflicts := make(map[string]bool)
+	for _, entry := range i.Entries {
+		if entry.Stage > 0 {
+			conflicts[entry.FilePath] = true
+		}
+	}
+	return conflicts
+}
+
+// ResolveConflict resolves a conflict by replacing the conflicted entries (stages 1, 2, 3)
+// with a single stage 0 entry.
+// This optimized version is more efficient at handling the entry manipulations.
+func (i *Index) ResolveConflict(repoRoot, filePath, resolvedHash string) error {
+	// Create a new list of entries, omitting the conflict entries
+	newEntries := make([]IndexEntry, 0, len(i.Entries))
+	hasStageZero := false
+	stageZeroIndex := -1
+
+	for j, entry := range i.Entries {
+		if entry.FilePath == filePath {
+			if entry.Stage == 0 {
+				hasStageZero = true
+				stageZeroIndex = j
+			} else {
+				// Skip this conflict entry
+				continue
+			}
+		}
+		newEntries = append(newEntries, entry)
+	}
+
+	// Get file stats for the resolved file
+	absPath := filepath.Join(repoRoot, filePath)
+	fileInfo, err := os.Stat(absPath)
+	if err != nil {
+		return fmt.Errorf("failed to stat resolved file: %w", err)
+	}
+
+	// Calculate file mode
+	mode := int32(100644) // Default to regular file
+	if fileInfo.Mode()&0111 != 0 {
+		mode = 100755 // Executable
+	}
+
+	// Create the resolved entry
+	resolvedEntry := IndexEntry{
+		Mode:     mode,
+		FilePath: filePath,
+		SHA256:   resolvedHash,
+		Size:     fileInfo.Size(),
+		Mtime:    fileInfo.ModTime(),
+		Stage:    0,
+	}
+
+	// Update or insert the resolved entry
+	if hasStageZero {
+		newEntries[stageZeroIndex] = resolvedEntry
+	} else {
+		newEntries = append(newEntries, resolvedEntry)
+	}
+
+	// Replace the entries list
+	i.Entries = newEntries
+
+	// Clear the entry map so it will be rebuilt on next access
+	i.entryMap = nil
+
+	return nil
+}
+
+// BatchResolveConflicts resolves multiple conflicts at once
+// This is a new function for advanced batch operations
+func (i *Index) BatchResolveConflicts(repoRoot string, resolutions map[string]string) error {
+	for filePath, hash := range resolutions {
+		if err := i.ResolveConflict(repoRoot, filePath, hash); err != nil {
+			return fmt.Errorf("failed to resolve conflict for %s: %w", filePath, err)
+		}
+	}
+	return nil
+}
+
+// CleanupConflictMarkers removes conflict markers from a file and returns its content.
+// This improved version is more robust in handling different types of conflict markers.
+func CleanupConflictMarkers(filePath string) ([]byte, error) {
+	content, err := os.ReadFile(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read file: %w", err)
+	}
+
+	lines := strings.Split(string(content), "\n")
+	var cleanedLines []string
+	inConflict := false
+	keepOurs := false
+
+	for _, line := range lines {
+		// Handle start of conflict markers (<<<<<<< HEAD or <<<<<<< branch)
+		if strings.HasPrefix(line, "<<<<<<< ") {
+			inConflict = true
+			keepOurs = true // By default we keep "ours" version
+			continue
+		}
+
+		// Handle end of conflict markers (>>>>>>> branch)
+		if strings.HasPrefix(line, ">>>>>>> ") {
+			inConflict = false
+			keepOurs = false
+			continue
+		}
+
+		// Handle separator between "ours" and "theirs" (=======)
+		if strings.HasPrefix(line, "=======") {
+			keepOurs = false
+			continue
+		}
+
+		// Keep the line if not in conflict, or if in conflict and we're keeping that section
+		if !inConflict || keepOurs {
+			cleanedLines = append(cleanedLines, line)
+		}
+	}
+
+	return []byte(strings.Join(cleanedLines, "\n")), nil
+}
+
+// AddEntry adds or updates an entry in the index
+// This is a new function for more advanced index manipulation
+func (i *Index) AddEntry(entry IndexEntry) {
+	// Check if the entry already exists (same path and stage)
+	for j := range i.Entries {
+		if i.Entries[j].FilePath == entry.FilePath && i.Entries[j].Stage == entry.Stage {
+			// Update the existing entry
+			i.Entries[j] = entry
+
+			// Clear the entry map so it will be rebuilt on next access
+			i.entryMap = nil
+			return
+		}
+	}
+
+	// Add as a new entry
+	i.Entries = append(i.Entries, entry)
+
+	// Update the entry map if it exists
+	if i.entryMap != nil {
+		key := fmt.Sprintf("%s:%d", entry.FilePath, entry.Stage)
+		i.entryMap[key] = &i.Entries[len(i.Entries)-1]
+	}
+}
+
+// RemoveEntry removes an entry from the index by path and stage
+// This is a new function for more advanced index manipulation
+func (i *Index) RemoveEntry(filePath string, stage int) bool {
+	for j := range i.Entries {
+		if i.Entries[j].FilePath == filePath && i.Entries[j].Stage == stage {
+			// Remove the entry
+			i.Entries = append(i.Entries[:j], i.Entries[j+1:]...)
+
+			// Clear the entry map so it will be rebuilt on next access
+			i.entryMap = nil
+			return true
+		}
+	}
+	return false
+}
+
+// FindPaths returns all file paths in the index that match a given pattern
+// This is a new function for advanced path searching
+func (i *Index) FindPaths(pattern string) []string {
+	var matches []string
+	seen := make(map[string]bool)
+
+	for _, entry := range i.Entries {
+		if seen[entry.FilePath] {
+			continue
+		}
+
+		matched, err := filepath.Match(pattern, entry.FilePath)
+		if err == nil && matched {
+			matches = append(matches, entry.FilePath)
+			seen[entry.FilePath] = true
+		}
+	}
+
+	return matches
+}

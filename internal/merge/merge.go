@@ -121,15 +121,15 @@ func Merge(repoRoot, sourceBranch string, config *MergeConfig) (bool, error) {
 	}
 
 	// Load tree objects.
-	baseTree, err := objects.GetTree(repoRoot, baseCommit.Tree)
+	baseTree, err := objects.GetTree(baseCommit.Tree)
 	if err != nil {
 		return false, fmt.Errorf("failed to load base tree: %w", err)
 	}
-	ourTree, err := objects.GetTree(repoRoot, ourCommit.Tree)
+	ourTree, err := objects.GetTree(ourCommit.Tree)
 	if err != nil {
 		return false, fmt.Errorf("failed to load our tree: %w", err)
 	}
-	theirTree, err := objects.GetTree(repoRoot, theirCommit.Tree)
+	theirTree, err := objects.GetTree(theirCommit.Tree)
 	if err != nil {
 		return false, fmt.Errorf("failed to load their tree: %w", err)
 	}
@@ -595,7 +595,7 @@ func CheckoutCommit(repoRoot, commitID string) error {
 	if err != nil {
 		return fmt.Errorf("failed to load commit %s: %w", commitID, err)
 	}
-	tree, err := objects.GetTree(repoRoot, commit.Tree)
+	tree, err := objects.GetTree(commit.Tree)
 	if err != nil {
 		return fmt.Errorf("failed to load tree %s: %w", commit.Tree, err)
 	}
@@ -639,7 +639,7 @@ func updateWorkingDirectory(repoRoot string, tree *objects.TreeObject, basePath 
 				return fmt.Errorf("failed to write file '%s': %w", currentPath, err)
 			}
 		} else if entry.Type == "tree" {
-			subTree, err := objects.GetTree(repoRoot, entry.Hash)
+			subTree, err := objects.GetTree(entry.Hash)
 			if err != nil {
 				return fmt.Errorf("failed to get subtree '%s': %w", entry.Hash, err)
 			}
@@ -672,7 +672,7 @@ func createIndexFromTree(repoRoot string, tree *objects.TreeObject, basePath str
 			}
 			index.Entries = append(index.Entries, indexEntry)
 		} else if entry.Type == "tree" {
-			subTree, err := objects.GetTree(repoRoot, entry.Hash)
+			subTree, err := objects.GetTree(entry.Hash)
 			if err != nil {
 				return nil, fmt.Errorf("failed to get subtree '%s': %w", entry.Hash, err)
 			}

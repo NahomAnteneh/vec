@@ -11,6 +11,13 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
+)
+
+// Global cache for ignore patterns to avoid reloading and reparsing .vecignore
+var (
+	ignorePatternCache      = make(map[string][]string)
+	ignorePatternCacheMutex sync.RWMutex
 )
 
 // ... (FileExists, HashFile, HashBytes, EnsureDirExists remain unchanged) ..
@@ -88,42 +95,67 @@ func IsIgnored(repoRoot, path string) (bool, error) {
 		return true, nil
 	}
 
-	// Check for .vecignore file
-	vecignorePath := filepath.Join(absRepoRoot, ".vecignore")
-	if FileExists(vecignorePath) {
-		vecignoreContent, err := os.ReadFile(vecignorePath)
-		if err != nil {
-			return false, fmt.Errorf("failed to read .vecignore: %w", err)
+	// Check for cached patterns first
+	ignorePatternCacheMutex.RLock()
+	patterns, ok := ignorePatternCache[absRepoRoot]
+	ignorePatternCacheMutex.RUnlock()
+
+	// If not in cache, load patterns from .vecignore
+	if !ok {
+		vecignorePath := filepath.Join(absRepoRoot, ".vecignore")
+		if FileExists(vecignorePath) {
+			vecignoreContent, err := os.ReadFile(vecignorePath)
+			if err != nil {
+				return false, fmt.Errorf("failed to read .vecignore: %w", err)
+			}
+
+			// Parse valid patterns
+			rawPatterns := strings.Split(string(vecignoreContent), "\n")
+			patterns = make([]string, 0, len(rawPatterns))
+
+			for _, pattern := range rawPatterns {
+				pattern = strings.TrimSpace(pattern)
+				if pattern == "" || strings.HasPrefix(pattern, "#") {
+					continue // Skip empty lines and comments
+				}
+
+				// Validate pattern before adding to cache
+				if _, err := filepath.Match(pattern, "test-filename"); err != nil {
+					// Log invalid pattern but don't fail
+					fmt.Fprintf(os.Stderr, "warning: invalid pattern in .vecignore: %s\n", pattern)
+					continue
+				}
+
+				patterns = append(patterns, filepath.Clean(pattern))
+			}
+
+			// Cache the parsed patterns
+			ignorePatternCacheMutex.Lock()
+			ignorePatternCache[absRepoRoot] = patterns
+			ignorePatternCacheMutex.Unlock()
+		} else {
+			// No .vecignore file, cache empty pattern list
+			ignorePatternCacheMutex.Lock()
+			ignorePatternCache[absRepoRoot] = []string{}
+			ignorePatternCacheMutex.Unlock()
+		}
+	}
+
+	// Match against patterns
+	for _, pattern := range patterns {
+		// Check for direct match first
+		matched, _ := filepath.Match(pattern, relPath) // Error already checked during parsing
+		if matched {
+			return true, nil
 		}
 
-		patterns := strings.Split(string(vecignoreContent), "\n")
-		for _, pattern := range patterns {
-			pattern = strings.TrimSpace(pattern)
-			if pattern == "" || strings.HasPrefix(pattern, "#") {
-				continue // Skip empty lines and comments
-			}
-
-			// Convert the pattern to a filepath pattern
-			pattern = filepath.Clean(pattern)
-
-			// Handle both exact matches and glob patterns
-			matched, err := filepath.Match(pattern, relPath)
-			if err != nil {
-				// Skip invalid patterns but continue processing others
-				continue
-			}
-			if matched {
+		// Check if pattern matches any parent directory
+		// Split path only once and reuse for all patterns
+		relPathParts := strings.Split(relPath, string(filepath.Separator))
+		for i := range relPathParts {
+			partialPath := filepath.Join(relPathParts[:i+1]...)
+			if matched, _ := filepath.Match(pattern, partialPath); matched {
 				return true, nil
-			}
-
-			// Also check if pattern matches any parent directory
-			relPathParts := strings.Split(relPath, string(filepath.Separator))
-			for i := range relPathParts {
-				partialPath := filepath.Join(relPathParts[:i+1]...)
-				matched, err := filepath.Match(pattern, partialPath)
-				if err == nil && matched {
-					return true, nil
-				}
 			}
 		}
 	}
@@ -176,16 +208,47 @@ func GetVecRoot() (string, error) {
 		return "", fmt.Errorf("failed to get current directory: %w", err)
 	}
 
+	// Store the original starting point to help with error message
+	startDir := currentDir
+
+	// Check for environment variable to force a specific repository path
+	if forcedRoot := os.Getenv("VEC_REPOSITORY_PATH"); forcedRoot != "" {
+		vecDir := filepath.Join(forcedRoot, ".vec")
+		if FileExists(vecDir) {
+			return forcedRoot, nil
+		}
+		return "", fmt.Errorf("VEC_REPOSITORY_PATH is set to '%s' but no repository found there", forcedRoot)
+	}
+
+	// Keep track of all found repositories to handle nested cases
+	var foundRepos []string
+
 	for {
 		vecDir := filepath.Join(currentDir, ".vec")
 		if FileExists(vecDir) {
-			return currentDir, nil
+			foundRepos = append(foundRepos, currentDir)
+
+			// If we've found multiple repositories, use the nearest one to the starting directory
+			if len(foundRepos) > 1 {
+				fmt.Fprintf(os.Stderr, "warning: multiple vec repositories detected in parent directories\n")
+				fmt.Fprintf(os.Stderr, "using repository at: %s\n", foundRepos[0])
+
+				// Optional: add information about setting VEC_REPOSITORY_PATH to override
+				fmt.Fprintf(os.Stderr, "to use a different repository, set VEC_REPOSITORY_PATH environment variable\n")
+			}
+
+			// Return the closest repository to our working directory
+			return foundRepos[0], nil
 		}
 
 		// Move to the parent directory.
 		parentDir := filepath.Dir(currentDir)
 		if parentDir == currentDir { // Reached root.
-			return "", fmt.Errorf("not a vec repository (or any of the parent directories)")
+			if len(foundRepos) > 0 {
+				// If we found repositories but they're not in the path to root, use the closest
+				return foundRepos[0], nil
+			}
+			return "", fmt.Errorf("not a vec repository (or any of the parent directories): %s", startDir)
 		}
 		currentDir = parentDir
 	}
