@@ -59,7 +59,7 @@ func CreateRepositoryBare(dir string) error {
 		if err != nil {
 			return fmt.Errorf("failed to read directory %s: %w", dir, err)
 		}
-		
+
 		if len(entries) > 0 {
 			return fmt.Errorf("directory %s is not empty", dir)
 		}

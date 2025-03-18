@@ -6,6 +6,7 @@ import (
 	"os"
 
 	"github.com/NahomAnteneh/vec/internal/remote"
+	"github.com/NahomAnteneh/vec/utils"
 	"github.com/spf13/cobra"
 )
 
@@ -19,7 +20,7 @@ If no branch is specified, the current branch is used.`,
 	Args: cobra.RangeArgs(0, 2),
 	Run: func(cmd *cobra.Command, args []string) {
 		// Get repository root
-		repoRoot, err := getRepoRoot()
+		repoRoot, err := utils.GetVecRoot()
 		if err != nil {
 			fmt.Printf("Error: %s\n", err)
 			os.Exit(1)

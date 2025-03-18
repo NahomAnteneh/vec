@@ -2,6 +2,7 @@
 package remote
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -446,8 +447,8 @@ func performPushWithClient(remoteURL, remoteName string, pushData map[string]int
 
 	endpoint := "push"
 
-	// Combine pushData and packfile
-	pushData["packfile"] = string(packfile)
+	// Convert packfile to base64 string to ensure proper JSON encoding
+	pushData["packfile"] = base64.StdEncoding.EncodeToString(packfile)
 
 	resp, err := makeRemoteRequest(remoteURL, endpoint, "POST", pushData, cfg, remoteName)
 	if err != nil {
@@ -473,28 +474,4 @@ func performPushWithClient(remoteURL, remoteName string, pushData map[string]int
 // performPush sends the packfile and updates refs on the remote
 func performPush(remoteURL, remoteName string, pushData map[string]interface{}, packfile []byte, cfg *config.Config) (*PushResult, error) {
 	return performPushWithClient(remoteURL, remoteName, pushData, packfile, cfg, nil)
-}
-
-// ApplyAuthHeaders adds authentication headers to the request
-func ApplyAuthHeaders(req *http.Request, remoteName string, cfg *config.Config) error {
-	// Get authentication token
-	auth, err := cfg.GetRemoteAuth(remoteName)
-	if err != nil {
-		// Auth not set is not an error, just continue without auth
-		return nil
-	}
-
-	if auth != "" {
-		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", auth))
-	}
-
-	// Add any custom headers
-	headers, err := cfg.GetRemoteHeaders(remoteName)
-	if err == nil && headers != nil {
-		for key, value := range headers {
-			req.Header.Set(key, value)
-		}
-	}
-
-	return nil
 }

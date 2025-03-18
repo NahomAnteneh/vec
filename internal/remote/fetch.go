@@ -7,9 +7,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
+	"net/http/httputil"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/NahomAnteneh/vec/internal/config"
@@ -17,12 +20,60 @@ import (
 	"github.com/NahomAnteneh/vec/utils"
 )
 
+// logRequest logs the details of an HTTP request
+func logRequest(req *http.Request) {
+	log.Printf("[HTTP Request] %s %s", req.Method, req.URL.String())
+	log.Printf("[HTTP Request] Headers:")
+	for name, values := range req.Header {
+		// Don't log the full authorization token for security reasons
+		if strings.ToLower(name) == "authorization" {
+			log.Printf("[HTTP Request]   %s: Bearer [TOKEN REDACTED]", name)
+		} else {
+			log.Printf("[HTTP Request]   %s: %s", name, values)
+		}
+	}
+	if req.Body != nil {
+		log.Printf("[HTTP Request] Has Body: true")
+	} else {
+		log.Printf("[HTTP Request] Has Body: false")
+	}
+}
+
+// logResponse logs the details of an HTTP response
+func logResponse(resp *http.Response) {
+	respDump, err := httputil.DumpResponse(resp, true)
+	if err != nil {
+		log.Printf("[HTTP Response] Error dumping response: %v", err)
+		return
+	}
+
+	// Limit the size of the dumped response to avoid overwhelming logs
+	maxSize := 2000
+	respLog := string(respDump)
+	if len(respLog) > maxSize {
+		respLog = respLog[:maxSize] + "... [truncated]"
+	}
+
+	log.Printf("[HTTP Response] Status: %s\n%s", resp.Status, respLog)
+}
+
 // Fetch retrieves refs and objects from the remote repository efficiently
 func Fetch(repoRoot, remoteName string) error {
+	log.Printf("[Fetch] Starting fetch from remote '%s'", remoteName)
+
 	// Load config
 	cfg, err := config.LoadConfig(repoRoot)
 	if err != nil {
 		return fmt.Errorf("failed to load config: %w", err)
+	}
+
+	// Debug config
+	log.Printf("[Fetch] Config loaded from %s", repoRoot)
+	if remote, exists := cfg.Remotes[remoteName]; exists {
+		log.Printf("[Fetch] Remote '%s' found in config: URL=%s, Auth=%v",
+			remoteName, remote.URL, remote.Auth != "")
+	} else {
+		log.Printf("[Fetch] Remote '%s' not found in loaded config", remoteName)
 	}
 
 	// Get remote URL
@@ -31,11 +82,15 @@ func Fetch(repoRoot, remoteName string) error {
 		return fmt.Errorf("failed to get remote URL: %w", err)
 	}
 
+	log.Printf("[Fetch] Using remote URL: %s", remoteURL)
+
 	// Fetch remote refs
 	refs, err := fetchRemoteRefs(remoteURL, remoteName, cfg)
 	if err != nil {
 		return fmt.Errorf("failed to fetch remote refs: %w", err)
 	}
+
+	log.Printf("[Fetch] Retrieved %d refs from remote", len(refs))
 
 	// Get local refs for negotiation
 	localRefs, err := getLocalRefs(repoRoot)
@@ -43,11 +98,15 @@ func Fetch(repoRoot, remoteName string) error {
 		return fmt.Errorf("failed to get local refs: %w", err)
 	}
 
+	log.Printf("[Fetch] Found %d local refs", len(localRefs))
+
 	// Negotiate with the server to determine missing objects
 	missingObjects, err := negotiateFetch(remoteURL, remoteName, refs, localRefs, cfg)
 	if err != nil {
 		return fmt.Errorf("failed to negotiate fetch: %w", err)
 	}
+
+	log.Printf("[Fetch] Negotiation complete, %d objects missing", len(missingObjects))
 
 	if len(missingObjects) == 0 {
 		fmt.Println("Already up to date.")
@@ -59,6 +118,8 @@ func Fetch(repoRoot, remoteName string) error {
 	if err != nil {
 		return fmt.Errorf("failed to fetch packfile: %w", err)
 	}
+
+	log.Printf("[Fetch] Received packfile of size %d bytes", len(packfile))
 
 	// Unpack the packfile using production logic
 	if err := unpackPackfile(repoRoot, packfile); err != nil {
@@ -74,8 +135,10 @@ func Fetch(repoRoot, remoteName string) error {
 		if err := os.WriteFile(refPath, []byte(commitHash+"\n"), 0644); err != nil {
 			return fmt.Errorf("failed to update tracking ref for %s: %w", branch, err)
 		}
+		log.Printf("[Fetch] Updated tracking ref for %s to %s", branch, commitHash)
 	}
 
+	log.Printf("[Fetch] Fetch completed successfully for remote '%s'", remoteName)
 	fmt.Println("Fetch completed successfully.")
 	return nil
 }
@@ -156,10 +219,13 @@ func FetchBranch(repoRoot, remoteName, branch string) error {
 
 // fetchRemoteRefs retrieves the branch refs from the remote with retry logic
 func fetchRemoteRefs(remoteURL, remoteName string, cfg *config.Config) (map[string]string, error) {
-	url := fmt.Sprintf("%s/refs/heads", remoteURL)
+	// Update URL path to match server's structure - using /:username/:repo_slug/refs
+	url := fmt.Sprintf("%s/refs", remoteURL)
+	log.Printf("[fetchRemoteRefs] Fetching refs from %s", url)
 	client := &http.Client{Timeout: 10 * time.Second}
 
 	for attempt := 1; attempt <= 3; attempt++ {
+		log.Printf("[fetchRemoteRefs] Attempt %d of 3", attempt)
 		req, err := http.NewRequest("GET", url, nil)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create request: %w", err)
@@ -168,24 +234,51 @@ func fetchRemoteRefs(remoteURL, remoteName string, cfg *config.Config) (map[stri
 		// Add authentication headers if available
 		ApplyAuthHeaders(req, remoteName, cfg)
 
+		// Log the request
+		logRequest(req)
+
 		resp, err := client.Do(req)
 		if err != nil {
+			log.Printf("[fetchRemoteRefs] Request error: %v", err)
 			if attempt == 3 {
 				return nil, fmt.Errorf("cannot contact remote after %d attempts: %w", attempt, err)
 			}
 			time.Sleep(time.Duration(attempt) * time.Second)
 			continue
 		}
+
+		// Log the response
+		logResponse(resp)
 		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("refs fetch failed with status %d", resp.StatusCode)
+			log.Printf("[fetchRemoteRefs] Error response: %d", resp.StatusCode)
+			return nil, fmt.Errorf("refs fetch failed with status %d (URL: %s)", resp.StatusCode, url)
 		}
 
+		// Try to decode as a direct map first
 		var refs map[string]string
-		if err := json.NewDecoder(resp.Body).Decode(&refs); err != nil {
-			return nil, fmt.Errorf("failed to decode refs: %w", err)
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			log.Printf("[fetchRemoteRefs] Failed to read response body: %v", err)
+			return nil, fmt.Errorf("failed to read response body: %w", err)
 		}
+
+		// Try to decode as a direct map
+		if err := json.Unmarshal(body, &refs); err != nil {
+			// If that fails, try to decode as a wrapped object with a "refs" field
+			log.Printf("[fetchRemoteRefs] Failed to decode as direct map, trying wrapped format: %v", err)
+			var wrappedRefs struct {
+				Refs map[string]string `json:"refs"`
+			}
+			if err := json.Unmarshal(body, &wrappedRefs); err != nil {
+				log.Printf("[fetchRemoteRefs] Failed to decode response in any format: %v", err)
+				return nil, fmt.Errorf("failed to decode refs: %w", err)
+			}
+			refs = wrappedRefs.Refs
+		}
+
+		log.Printf("[fetchRemoteRefs] Successfully fetched %d refs", len(refs))
 		return refs, nil
 	}
 	return nil, fmt.Errorf("unexpected error in fetchRemoteRefs")
@@ -221,12 +314,18 @@ func getLocalRefs(repoRoot string) (map[string]string, error) {
 
 // negotiateFetch determines which objects are missing by negotiating with the server
 func negotiateFetch(remoteURL, remoteName string, remoteRefs, localRefs map[string]string, cfg *config.Config) ([]string, error) {
+	log.Printf("[negotiateFetch] Starting negotiation for %d remote refs against %d local refs",
+		len(remoteRefs), len(localRefs))
+
 	negotiationData := map[string]interface{}{
 		"want": remoteRefs,
 		"have": localRefs,
 	}
 
-	url := fmt.Sprintf("%s/fetch/negotiate", remoteURL)
+	// Use the correct URL format for the negotiate endpoint
+	url := fmt.Sprintf("%s/negotiate", remoteURL)
+	log.Printf("[negotiateFetch] Negotiating with endpoint: %s", url)
+
 	data, err := json.Marshal(negotiationData)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal negotiation data: %w", err)
@@ -241,27 +340,39 @@ func negotiateFetch(remoteURL, remoteName string, remoteRefs, localRefs map[stri
 	// Add authentication headers if available
 	ApplyAuthHeaders(req, remoteName, cfg)
 
+	// Log the request
+	logRequest(req)
+
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
+		log.Printf("[negotiateFetch] Request error: %v", err)
 		return nil, fmt.Errorf("negotiation request failed: %w", err)
 	}
+
+	// Log the response
+	logResponse(resp)
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("negotiation failed with status %d", resp.StatusCode)
+		log.Printf("[negotiateFetch] Error response: %d", resp.StatusCode)
+		return nil, fmt.Errorf("negotiation failed with status %d (URL: %s)", resp.StatusCode, url)
 	}
 
 	var missingObjects []string
 	if err := json.NewDecoder(resp.Body).Decode(&missingObjects); err != nil {
+		log.Printf("[negotiateFetch] Failed to decode response: %v", err)
 		return nil, fmt.Errorf("failed to decode missing objects: %w", err)
 	}
+	log.Printf("[negotiateFetch] Negotiation complete, %d objects missing", len(missingObjects))
 	return missingObjects, nil
 }
 
 // fetchPackfile retrieves a packfile containing the specified objects
 func fetchPackfile(remoteURL, remoteName string, objectsList []string, cfg *config.Config) ([]byte, error) {
-	url := fmt.Sprintf("%s/fetch/packfile", remoteURL)
+	// Use the correct URL format for the packfile endpoint
+	url := fmt.Sprintf("%s/packfile", remoteURL)
+	log.Printf("[fetchPackfile] Fetching packfile from %s for %d objects", url, len(objectsList))
 	client := &http.Client{Timeout: 30 * time.Second}
 
 	data, err := json.Marshal(objectsList)
@@ -270,6 +381,7 @@ func fetchPackfile(remoteURL, remoteName string, objectsList []string, cfg *conf
 	}
 
 	for attempt := 1; attempt <= 3; attempt++ {
+		log.Printf("[fetchPackfile] Attempt %d of 3", attempt)
 		req, err := http.NewRequest("POST", url, bytes.NewBuffer(data))
 		if err != nil {
 			return nil, fmt.Errorf("failed to create request: %w", err)
@@ -279,27 +391,46 @@ func fetchPackfile(remoteURL, remoteName string, objectsList []string, cfg *conf
 		// Add authentication headers if available
 		ApplyAuthHeaders(req, remoteName, cfg)
 
+		// Log the request
+		logRequest(req)
+
 		resp, err := client.Do(req)
 		if err != nil {
+			log.Printf("[fetchPackfile] Request error: %v", err)
 			if attempt == 3 {
 				return nil, fmt.Errorf("failed to fetch packfile after %d attempts: %w", attempt, err)
 			}
 			time.Sleep(time.Duration(attempt) * time.Second)
 			continue
 		}
+
+		// Log the response headers (not the body as it might be large)
+		log.Printf("[HTTP Response] Status: %s", resp.Status)
+		log.Printf("[HTTP Response] Headers: %v", resp.Header)
+		log.Printf("[HTTP Response] Content-Length: %s", resp.Header.Get("Content-Length"))
 		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("packfile fetch failed with status %d", resp.StatusCode)
+			log.Printf("[fetchPackfile] Error response: %d", resp.StatusCode)
+			return nil, fmt.Errorf("packfile fetch failed with status %d (URL: %s)", resp.StatusCode, url)
 		}
 
 		packfile, err := io.ReadAll(resp.Body)
 		if err != nil {
+			log.Printf("[fetchPackfile] Failed to read response body: %v", err)
 			return nil, fmt.Errorf("failed to read packfile: %w", err)
 		}
+		log.Printf("[fetchPackfile] Successfully received packfile (%d bytes)", len(packfile))
 		return packfile, nil
 	}
 	return nil, fmt.Errorf("unexpected error in fetchPackfile")
+}
+
+// getBaseURL extracts the base API URL from a repository-specific URL
+func getBaseURL(repoURL string) string {
+	// No need to strip any path components - we want to preserve the entire URL
+	// to ensure the server knows which repository we're working with
+	return repoURL
 }
 
 // unpackPackfile unpacks the packfile into the local object store using the modern packfile format

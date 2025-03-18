@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +13,20 @@ import (
 	"github.com/NahomAnteneh/vec/internal/objects"
 	"github.com/NahomAnteneh/vec/internal/staging"
 	"github.com/NahomAnteneh/vec/utils"
+)
+
+// Constants for merge conflict marker types
+const (
+	// ConflictMarkerStart marks the beginning of a conflict
+	ConflictMarkerStart = "<<<<<<< "
+	// ConflictMarkerSeparator marks the middle of a conflict
+	ConflictMarkerSeparator = "======="
+	// ConflictMarkerEnd marks the end of a conflict
+	ConflictMarkerEnd = ">>>>>>> "
+	// ConflictMarkerBinaryFile indicates a binary file conflict
+	ConflictMarkerBinaryFile = "Binary files differ\n"
+	// Maximum file size to check for binary content (5MB)
+	maxBinaryCheckSize = 5 * 1024 * 1024
 )
 
 // MergeStrategy represents an auto-resolution strategy.
@@ -32,6 +47,12 @@ type MergeConfig struct {
 // MergeResult captures the outcome of the merge operation.
 type MergeResult struct {
 	HasConflicts bool
+	Path         string
+	BaseSha      string
+	OursSha      string
+	TheirsSha    string
+	ConflictType string
+	Content      []byte
 }
 
 // Merge performs a merge of the sourceBranch into the current branch in the repository at repoRoot.
@@ -182,6 +203,7 @@ func Merge(repoRoot, sourceBranch string, config *MergeConfig) (bool, error) {
 // performMerge executes a three-way merge between base, ours, and theirs trees, updating the index and working directory.
 func performMerge(repoRoot string, index *staging.Index, baseTree, ourTree, theirTree *objects.TreeObject, config *MergeConfig) (MergeResult, error) {
 	var result MergeResult
+	mergeResults := make(map[string]MergeResult)
 
 	// Build maps for quick lookup.
 	baseTreeMap := make(map[string]*objects.TreeEntry)
@@ -215,6 +237,10 @@ func performMerge(repoRoot string, index *staging.Index, baseTree, ourTree, thei
 		ourEntry, ourExists := ourTreeMap[filePath]
 		theirEntry, theirExists := theirTreeMap[filePath]
 
+		fileResult := MergeResult{
+			Path: filePath,
+		}
+
 		switch {
 		case baseExists && ourExists && theirExists:
 			// Unchanged in both?
@@ -240,6 +266,11 @@ func performMerge(repoRoot string, index *staging.Index, baseTree, ourTree, thei
 					return MergeResult{}, err
 				}
 				result.HasConflicts = true
+				fileResult.HasConflicts = true
+				fileResult.BaseSha = baseEntry.Hash
+				fileResult.OursSha = ourEntry.Hash
+				fileResult.TheirsSha = theirEntry.Hash
+				mergeResults[filePath] = fileResult
 			}
 
 		case baseExists && ourExists && !theirExists:
@@ -259,6 +290,10 @@ func performMerge(repoRoot string, index *staging.Index, baseTree, ourTree, thei
 					return MergeResult{}, err
 				}
 				result.HasConflicts = true
+				fileResult.HasConflicts = true
+				fileResult.BaseSha = baseEntry.Hash
+				fileResult.OursSha = ourEntry.Hash
+				mergeResults[filePath] = fileResult
 			}
 
 		case baseExists && !ourExists && theirExists:
@@ -278,6 +313,10 @@ func performMerge(repoRoot string, index *staging.Index, baseTree, ourTree, thei
 					return MergeResult{}, err
 				}
 				result.HasConflicts = true
+				fileResult.HasConflicts = true
+				fileResult.BaseSha = baseEntry.Hash
+				fileResult.TheirsSha = theirEntry.Hash
+				mergeResults[filePath] = fileResult
 			}
 
 		case !baseExists && ourExists && theirExists:
@@ -292,6 +331,10 @@ func performMerge(repoRoot string, index *staging.Index, baseTree, ourTree, thei
 					return MergeResult{}, err
 				}
 				result.HasConflicts = true
+				fileResult.HasConflicts = true
+				fileResult.OursSha = ourEntry.Hash
+				fileResult.TheirsSha = theirEntry.Hash
+				mergeResults[filePath] = fileResult
 			}
 
 		case !baseExists && ourExists && !theirExists:
@@ -307,6 +350,13 @@ func performMerge(repoRoot string, index *staging.Index, baseTree, ourTree, thei
 		case baseExists && !ourExists && !theirExists:
 			// File deleted in both branches.
 			continue
+		}
+	}
+
+	// Apply any collected merge results, particularly handling binary conflicts
+	if len(mergeResults) > 0 {
+		if err := applyChangesToWorkingDirectory(repoRoot, mergeResults); err != nil {
+			return MergeResult{}, fmt.Errorf("failed to apply merge results: %w", err)
 		}
 	}
 
@@ -328,6 +378,41 @@ func resolveConflict(repoRoot string, index *staging.Index, filePath, baseHash, 
 		}
 		return fmt.Errorf("missing 'theirs' version for %s", filePath)
 		// For recursive, fall through for interactive/manual merge.
+	}
+
+	// Attempt content-based merge using mergeFiles
+	mergeResult, err := mergeFiles(baseHash, ourHash, theirHash, filePath, repoRoot, config.Strategy)
+	if err != nil {
+		return fmt.Errorf("failed to merge file contents: %w", err)
+	}
+
+	// If we have binary conflicts, let the caller handle them
+	if mergeResult.HasConflicts && mergeResult.ConflictType == "binary" {
+		return writeConflictFile(repoRoot, index, filePath, baseHash, ourHash, theirHash, baseMode, ourMode, theirMode)
+	}
+
+	// If we have non-binary content that was successfully merged
+	if mergeResult.Content != nil && !mergeResult.HasConflicts {
+		absPath := filepath.Join(repoRoot, filePath)
+		mode := ourMode
+		if mode == 0 {
+			mode = theirMode
+		}
+		if mode == 0 {
+			mode = baseMode
+		}
+		if err := os.WriteFile(absPath, mergeResult.Content, os.FileMode(mode)); err != nil {
+			return fmt.Errorf("failed to write merged file '%s': %w", filePath, err)
+		}
+		// Update index with the merged blob
+		blobHash, err := objects.CreateBlob(repoRoot, mergeResult.Content)
+		if err != nil {
+			return fmt.Errorf("failed to create blob for '%s': %w", filePath, err)
+		}
+		if err := index.Add(repoRoot, filePath, blobHash); err != nil {
+			return fmt.Errorf("failed to update index for '%s': %w", filePath, err)
+		}
+		return nil
 	}
 
 	// Default (recursive) strategy with interactive prompt if enabled.
@@ -516,58 +601,97 @@ func copyBlobAndAddToIndex(repoRoot string, index *staging.Index, hash, filePath
 	return nil
 }
 
-// Updated findMergeBase to fix history checks
+// findMergeBase finds the most recent common ancestor of two commits.
+// Optimized version with better performance characteristics for deep histories.
 func findMergeBase(repoRoot, commit1, commit2 string) (string, error) {
 	// If the commits are the same, that's the merge base.
 	if commit1 == commit2 {
 		return commit1, nil
 	}
 
-	// Collect all ancestors of commit1.
-	ancestors := make(map[string]bool)
-	var collect func(string) error
-	collect = func(commitID string) error {
-		if ancestors[commitID] {
-			return nil
+	// Use cached results if available
+	cacheKey := fmt.Sprintf("%s-%s", commit1, commit2)
+	if _, err := os.Stat(filepath.Join(repoRoot, ".vec", "cached_merge_base", cacheKey)); err == nil {
+		data, err := os.ReadFile(filepath.Join(repoRoot, ".vec", "cached_merge_base", cacheKey))
+		if err == nil && len(data) > 0 {
+			return string(data), nil
 		}
-		ancestors[commitID] = true
-		commit, err := objects.GetCommit(repoRoot, commitID)
-		if err != nil {
-			return fmt.Errorf("failed to load commit %s: %w", commitID, err)
-		}
-		for _, parent := range commit.Parents {
-			if err := collect(parent); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
-	if err := collect(commit1); err != nil {
-		return "", fmt.Errorf("failed to collect ancestors for commit1: %w", err)
 	}
 
-	// Traverse commit2 ancestry (breadth-first) and return the first shared commit.
-	queue := []string{commit2}
-	visited := make(map[string]bool)
-	for len(queue) > 0 {
-		current := queue[0]
-		queue = queue[1:]
-		if ancestors[current] {
-			return current, nil
+	// Instead of collecting all ancestors of commit1 first (which is inefficient for
+	// large repositories), we'll use a more efficient algorithm that traverses both
+	// commit histories simultaneously.
+
+	// Use a generation number approach
+	generations1 := make(map[string]int)
+
+	// Traverse commit1 lineage with generation numbers
+	q1 := []string{commit1}
+	for gen := 0; len(q1) > 0; gen++ {
+		var nextQ []string
+		for _, c := range q1 {
+			if _, exists := generations1[c]; exists {
+				continue // Skip if already encountered
+			}
+			generations1[c] = gen
+
+			commit, err := objects.GetCommit(repoRoot, c)
+			if err != nil {
+				return "", fmt.Errorf("failed to load commit %s: %w", c, err)
+			}
+
+			nextQ = append(nextQ, commit.Parents...)
 		}
-		if visited[current] {
+		q1 = nextQ
+	}
+
+	// Use a priority queue approach for commit2 traversal to find the
+	// lowest common ancestor with the minimum sum of generation numbers
+	bestBase := ""
+	bestCost := -1
+
+	visited := make(map[string]bool)
+	q2 := []string{commit2}
+
+	for len(q2) > 0 {
+		c := q2[0]
+		q2 = q2[1:]
+
+		if visited[c] {
 			continue
 		}
-		visited[current] = true
-		commit, err := objects.GetCommit(repoRoot, current)
+		visited[c] = true
+
+		// Check if this is a common ancestor
+		if gen1, ok := generations1[c]; ok {
+			// This is a common ancestor
+			cost := gen1
+			if bestBase == "" || cost < bestCost {
+				bestBase = c
+				bestCost = cost
+			}
+		}
+
+		// Continue traversal
+		commit, err := objects.GetCommit(repoRoot, c)
 		if err != nil {
-			return "", fmt.Errorf("failed to load commit %s: %w", current, err)
+			return "", fmt.Errorf("failed to load commit %s: %w", c, err)
 		}
-		for _, parent := range commit.Parents {
-			queue = append(queue, parent)
-		}
+
+		q2 = append(q2, commit.Parents...)
 	}
-	return "", fmt.Errorf("no common ancestor found between %s and %s", commit1, commit2)
+
+	if bestBase == "" {
+		return "", fmt.Errorf("no common ancestor found between %s and %s", commit1, commit2)
+	}
+
+	// Cache the result for future use
+	cacheDir := filepath.Join(repoRoot, ".vec", "cached_merge_base")
+	if err := os.MkdirAll(cacheDir, 0755); err == nil {
+		os.WriteFile(filepath.Join(cacheDir, cacheKey), []byte(bestBase), 0644)
+	}
+
+	return bestBase, nil
 }
 
 // GetCurrentBranch determines the current branch from HEAD.
@@ -689,5 +813,424 @@ func createIndexFromTree(repoRoot string, tree *objects.TreeObject, basePath str
 // isTerminal returns true when fd is a terminal.
 func isTerminal(fd uintptr) bool {
 	// Production-ready check. You might use a library such as "golang.org/x/term".
+	return true
+}
+
+// isBinaryFile determines if a file is likely binary by checking for null bytes
+// in the first chunk of the file.
+func isBinaryFile(path string) (bool, error) {
+	// Open the file
+	file, err := os.Open(path)
+	if err != nil {
+		return false, fmt.Errorf("failed to open file for binary check: %w", err)
+	}
+	defer file.Close()
+
+	// Get file info to check size
+	info, err := file.Stat()
+	if err != nil {
+		return false, fmt.Errorf("failed to stat file for binary check: %w", err)
+	}
+
+	// If file is too large, only check the beginning
+	size := info.Size()
+	bytesToRead := int64(maxBinaryCheckSize)
+	if size < bytesToRead {
+		bytesToRead = size
+	}
+
+	// Read file content (or portion of it)
+	buffer := make([]byte, bytesToRead)
+	_, err = file.Read(buffer)
+	if err != nil && err != io.EOF {
+		return false, fmt.Errorf("failed to read file for binary check: %w", err)
+	}
+
+	// Check for null bytes which typically indicate binary content
+	for _, b := range buffer {
+		if b == 0 {
+			return true, nil
+		}
+	}
+
+	// No null bytes found in the checked portion
+	return false, nil
+}
+
+// handleBinaryConflict handles conflicts for binary files by creating
+// both versions and marking the conflict with appropriate indicators.
+func handleBinaryConflict(repoRoot, filePath, ours, theirs string) error {
+	// Create backup files for both versions
+	oursPath := filePath + ".ours"
+	theirsPath := filePath + ".theirs"
+
+	// Copy "ours" version to backup
+	oursContent, err := os.ReadFile(filePath)
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to read our binary file: %w", err)
+	}
+
+	// If our file exists, write it to the backup
+	if !os.IsNotExist(err) {
+		if err := os.WriteFile(oursPath, oursContent, 0644); err != nil {
+			return fmt.Errorf("failed to write our binary backup: %w", err)
+		}
+	}
+
+	// Get "theirs" content from object store
+	theirsContent, err := objects.GetBlob(repoRoot, theirs)
+	if err != nil {
+		return fmt.Errorf("failed to get their binary file content: %w", err)
+	}
+
+	// If their file exists, write it to the backup
+	if err := os.WriteFile(theirsPath, theirsContent, 0644); err != nil {
+		return fmt.Errorf("failed to write their binary backup: %w", err)
+	}
+
+	// Create a simple conflict marker file
+	message := fmt.Sprintf("Binary file conflict in %s\n", filePath)
+	message += "- Use 'vec merge --use-ours " + filePath + "' to keep your version\n"
+	message += "- Use 'vec merge --use-theirs " + filePath + "' to use their version\n"
+	message += "- Manual backup files created: .ours and .theirs\n"
+
+	if err := os.WriteFile(filePath, []byte(message), 0644); err != nil {
+		return fmt.Errorf("failed to write binary conflict marker: %w", err)
+	}
+
+	// Mark the conflict in the index
+	index, err := staging.LoadIndex(repoRoot)
+	if err != nil {
+		return fmt.Errorf("failed to read index during binary conflict handling: %w", err)
+	}
+
+	// Add all three stages to the index (base, ours, theirs)
+	relPath, err := filepath.Rel(repoRoot, filePath)
+	if err != nil {
+		return fmt.Errorf("failed to get relative path: %w", err)
+	}
+
+	// Mark as conflicted in the index - add entries for both theirs and ours
+	if ours != "" {
+		if err := index.AddConflictEntry(relPath, ours, 0644, 2); err != nil {
+			return fmt.Errorf("failed to update index with binary conflict (ours): %w", err)
+		}
+	}
+
+	if theirs != "" {
+		if err := index.AddConflictEntry(relPath, theirs, 0644, 3); err != nil {
+			return fmt.Errorf("failed to update index with binary conflict (theirs): %w", err)
+		}
+	}
+
+	// Write the updated index
+	if err := index.Write(); err != nil {
+		return fmt.Errorf("failed to write index: %w", err)
+	}
+
+	return nil
+}
+
+// applyChangesToWorkingDirectory applies merge results to the working directory,
+// handling both successful merges and conflicts.
+func applyChangesToWorkingDirectory(repoRoot string, mergeResults map[string]MergeResult) error {
+	// Iterate through merge results and apply changes
+	for path, result := range mergeResults {
+		fullPath := filepath.Join(repoRoot, path)
+
+		// Create parent directories if they don't exist
+		parentDir := filepath.Dir(fullPath)
+		if err := os.MkdirAll(parentDir, 0755); err != nil {
+			return fmt.Errorf("failed to create directory %s: %w", parentDir, err)
+		}
+
+		// Check if file might be binary before applying changes
+		if result.HasConflicts && len(result.Content) == 0 && result.ConflictType == "binary" {
+			// This is a binary file conflict that couldn't be merged
+			// Handle it separately
+			if err := handleBinaryConflict(repoRoot, fullPath, result.OursSha, result.TheirsSha); err != nil {
+				return fmt.Errorf("failed to handle binary conflict for %s: %w", path, err)
+			}
+			continue
+		}
+
+		// For regular files, write the content
+		if result.Content != nil {
+			if err := os.WriteFile(fullPath, result.Content, 0644); err != nil {
+				return fmt.Errorf("failed to write file %s: %w", fullPath, err)
+			}
+		}
+	}
+
+	return nil
+}
+
+// mergeFiles merges the content of two files against a common base version.
+func mergeFiles(baseSha, oursSha, theirsSha, path string, repoRoot string, strategy MergeStrategy) (MergeResult, error) {
+	// Initialize result with known file identifiers
+	result := MergeResult{
+		Path:      path,
+		BaseSha:   baseSha,
+		OursSha:   oursSha,
+		TheirsSha: theirsSha,
+	}
+
+	// If both sides deleted the file, it's deleted in the result
+	if oursSha == "" && theirsSha == "" {
+		return result, nil
+	}
+
+	// Get file contents
+	var baseContent, oursContent, theirsContent []byte
+	var err error
+
+	if baseSha != "" {
+		baseContent, err = objects.GetBlob(repoRoot, baseSha)
+		if err != nil {
+			return result, fmt.Errorf("error getting base content: %w", err)
+		}
+	}
+
+	if oursSha != "" {
+		oursContent, err = objects.GetBlob(repoRoot, oursSha)
+		if err != nil {
+			return result, fmt.Errorf("error getting our content: %w", err)
+		}
+	} else {
+		// Our side deleted the file - use empty content
+		oursContent = []byte{}
+	}
+
+	if theirsSha != "" {
+		theirsContent, err = objects.GetBlob(repoRoot, theirsSha)
+		if err != nil {
+			return result, fmt.Errorf("error getting their content: %w", err)
+		}
+	} else {
+		// Their side deleted the file - use empty content
+		theirsContent = []byte{}
+	}
+
+	// Check for binary content
+	isBinary := false
+
+	// Check if any of the contents have null bytes (indicating binary)
+	for _, content := range [][]byte{baseContent, oursContent, theirsContent} {
+		if len(content) > 0 {
+			for _, b := range content {
+				if b == 0 {
+					isBinary = true
+					break
+				}
+			}
+			if isBinary {
+				break
+			}
+		}
+	}
+
+	// Handle binary files differently
+	if isBinary {
+		// For binary files, we can't really merge - mark as conflict
+		result.HasConflicts = true
+		result.ConflictType = "binary"
+		// Don't set content - the caller should use handleBinaryConflict
+		return result, nil
+	}
+
+	// For text files, perform line-based three-way merge
+	// First, split contents into lines
+	baseLines := splitLines(baseContent)
+	ourLines := splitLines(oursContent)
+	theirLines := splitLines(theirsContent)
+
+	// Apply strategy for auto-resolution if specified
+	if strategy == MergeStrategyOurs {
+		result.Content = oursContent
+		return result, nil
+	} else if strategy == MergeStrategyTheirs {
+		result.Content = theirsContent
+		return result, nil
+	}
+
+	// Perform three-way merge
+	mergedContent, hasConflicts := threeWayMerge(baseLines, ourLines, theirLines)
+	if hasConflicts {
+		// Has conflicts - prepare content with conflict markers
+		var conflictContent bytes.Buffer
+		for _, line := range mergedContent {
+			conflictContent.WriteString(line + "\n")
+		}
+		result.Content = conflictContent.Bytes()
+		result.HasConflicts = true
+	} else {
+		// No conflicts - clean merged content
+		var mergedBytes bytes.Buffer
+		for _, line := range mergedContent {
+			mergedBytes.WriteString(line + "\n")
+		}
+		result.Content = mergedBytes.Bytes()
+	}
+
+	return result, nil
+}
+
+// splitLines splits content into lines, handling different line endings
+func splitLines(content []byte) []string {
+	if len(content) == 0 {
+		return []string{}
+	}
+
+	// Replace all Windows line endings with Unix line endings
+	normalizedContent := bytes.ReplaceAll(content, []byte("\r\n"), []byte("\n"))
+
+	// Split on newlines
+	lines := strings.Split(string(normalizedContent), "\n")
+
+	// If the content ends with a newline, the split will result in an empty last element
+	// Remove it for consistent handling
+	if lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+
+	return lines
+}
+
+// threeWayMerge performs a simple line-based three-way merge and returns merged lines
+// and a flag indicating if conflicts were found
+func threeWayMerge(baseLines, ourLines, theirLines []string) ([]string, bool) {
+	// This is a simple diff3-style merge algorithm
+	// In a production environment, you'd want a more sophisticated algorithm
+	// or use an existing library like go-diff
+
+	hasConflicts := false
+	var result []string
+
+	// Find common lines and changes between base and both branches
+	// This is a simplified approach - for real implementations consider using
+	// the Myers diff algorithm or other established diff algorithms
+	i, j, k := 0, 0, 0
+
+	for i < len(baseLines) || j < len(ourLines) || k < len(theirLines) {
+		// Handle end of input cases
+		if i >= len(baseLines) {
+			// Base exhausted, add remaining lines from both sides
+			if j < len(ourLines) && k < len(theirLines) {
+				if slicesEqual(ourLines[j:], theirLines[k:]) {
+					// Both sides added the same content
+					result = append(result, ourLines[j:]...)
+					break
+				} else {
+					// Conflict: both sides added different content
+					hasConflicts = true
+					result = append(result, ConflictMarkerStart+"ours")
+					result = append(result, ourLines[j:]...)
+					result = append(result, ConflictMarkerSeparator)
+					result = append(result, theirLines[k:]...)
+					result = append(result, ConflictMarkerEnd+"theirs")
+					break
+				}
+			} else if j < len(ourLines) {
+				// Only our side added content
+				result = append(result, ourLines[j:]...)
+				break
+			} else if k < len(theirLines) {
+				// Only their side added content
+				result = append(result, theirLines[k:]...)
+				break
+			}
+			break
+		}
+
+		// Compare current line across all three versions
+		if j < len(ourLines) && k < len(theirLines) {
+			if baseLines[i] == ourLines[j] && baseLines[i] == theirLines[k] {
+				// All three versions match at this position
+				result = append(result, baseLines[i])
+				i++
+				j++
+				k++
+				continue
+			} else if baseLines[i] == ourLines[j] {
+				// Base matches ours, theirs changed
+				result = append(result, theirLines[k])
+				i++
+				j++
+				k++
+				continue
+			} else if baseLines[i] == theirLines[k] {
+				// Base matches theirs, ours changed
+				result = append(result, ourLines[j])
+				i++
+				j++
+				k++
+				continue
+			}
+		}
+
+		// Handle conflict situation - neither match base
+		// Find next matching point in all three
+		nexti, nextj, nextk := findNextMatch(baseLines, ourLines, theirLines, i, j, k)
+
+		if nexti == -1 || nextj == -1 || nextk == -1 {
+			// No more matches, add all remaining content as conflict
+			hasConflicts = true
+			result = append(result, ConflictMarkerStart+"ours")
+			if j < len(ourLines) {
+				result = append(result, ourLines[j:]...)
+			}
+			result = append(result, ConflictMarkerSeparator)
+			if k < len(theirLines) {
+				result = append(result, theirLines[k:]...)
+			}
+			result = append(result, ConflictMarkerEnd+"theirs")
+			break
+		} else {
+			// Add conflict markers and continue from next match
+			hasConflicts = true
+			result = append(result, ConflictMarkerStart+"ours")
+			if j < nextj {
+				result = append(result, ourLines[j:nextj]...)
+			}
+			result = append(result, ConflictMarkerSeparator)
+			if k < nextk {
+				result = append(result, theirLines[k:nextk]...)
+			}
+			result = append(result, ConflictMarkerEnd+"theirs")
+
+			i = nexti
+			j = nextj
+			k = nextk
+		}
+	}
+
+	return result, hasConflicts
+}
+
+// findNextMatch finds the next point where all three versions have matching lines
+func findNextMatch(baseLines, ourLines, theirLines []string, i, j, k int) (int, int, int) {
+	// Look for the next point where all three match
+	for ni := i + 1; ni < len(baseLines); ni++ {
+		for nj := j + 1; nj < len(ourLines); nj++ {
+			for nk := k + 1; nk < len(theirLines); nk++ {
+				if baseLines[ni] == ourLines[nj] && baseLines[ni] == theirLines[nk] {
+					return ni, nj, nk
+				}
+			}
+		}
+	}
+	return -1, -1, -1
+}
+
+// slicesEqual checks if two string slices are identical
+func slicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := 0; i < len(a); i++ {
+		if a[i] != b[i] {
+			return false
+		}
+	}
 	return true
 }

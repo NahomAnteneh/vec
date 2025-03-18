@@ -9,9 +9,11 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/NahomAnteneh/vec/internal/config"
+	"github.com/NahomAnteneh/vec/internal/merge"
 	"github.com/NahomAnteneh/vec/utils"
 )
 
@@ -37,7 +39,7 @@ type RemoteInfo struct {
 	URL           string
 	DefaultBranch string
 	Branches      []string
-	LastFetched   time.Time
+	LastFetched   int64
 }
 
 // AddRemote adds a new remote repository reference to the configuration
@@ -200,34 +202,88 @@ func SetRemoteAuth(repoRoot, name, authToken string) error {
 	return nil
 }
 
-// ListRemotes returns information about all configured remotes
-func ListRemotes(repoRoot string) ([]RemoteInfo, error) {
-	// Load config
+// ListRemotes retrieves information about all configured remotes
+func ListRemotes(repoRoot string) (map[string]RemoteInfo, error) {
+	remotes := make(map[string]RemoteInfo)
+
+	// Load config to get remote URLs
 	cfg, err := config.LoadConfig(repoRoot)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load config: %w", err)
 	}
 
-	remotes := []RemoteInfo{}
-	for name, remote := range cfg.Remotes {
-		// Get list of remote branches
-		branches, _ := listRemoteBranches(repoRoot, name)
+	// Get all configured remotes
+	remoteURLs := cfg.Remotes
+	if len(remoteURLs) == 0 {
+		return remotes, nil
+	}
 
-		// Determine default branch
-		defaultBranch := "main" // Default
-		if len(branches) > 0 {
-			defaultBranch = branches[0]
+	for name, remote := range remoteURLs {
+		info := RemoteInfo{
+			Name: name,
+			URL:  remote.URL,
 		}
 
-		remotes = append(remotes, RemoteInfo{
-			Name:          name,
-			URL:           remote.URL,
-			DefaultBranch: defaultBranch,
-			Branches:      branches,
-		})
+		// Get tracked branches for this remote
+		remoteBranchesDir := filepath.Join(repoRoot, ".vec", "refs", "remotes", name)
+		if _, err := os.Stat(remoteBranchesDir); err == nil {
+			branches, err := getBranchesForRemote(remoteBranchesDir)
+			if err == nil && len(branches) > 0 {
+				info.Branches = branches
+				// Assume first branch is default if we have branches
+				info.DefaultBranch = branches[0]
+			}
+		}
+
+		// Get last fetched time if available
+		fetchInfoPath := filepath.Join(repoRoot, ".vec", "FETCH_INFO", name)
+		if fetchInfo, err := os.ReadFile(fetchInfoPath); err == nil {
+			info.LastFetched = parseLastFetchedTime(string(fetchInfo))
+		}
+
+		remotes[name] = info
 	}
 
 	return remotes, nil
+}
+
+// Helper function to get branches for a remote
+func getBranchesForRemote(remoteBranchesDir string) ([]string, error) {
+	var branches []string
+
+	err := filepath.Walk(remoteBranchesDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		if !info.IsDir() {
+			relPath, err := filepath.Rel(remoteBranchesDir, path)
+			if err != nil {
+				return err
+			}
+			branches = append(branches, relPath)
+		}
+
+		return nil
+	})
+
+	return branches, err
+}
+
+// Helper to parse last fetched time from fetch info file
+func parseLastFetchedTime(fetchInfo string) int64 {
+	lines := strings.Split(fetchInfo, "\n")
+	for _, line := range lines {
+		if strings.HasPrefix(line, "timestamp:") {
+			parts := strings.SplitN(line, ":", 2)
+			if len(parts) == 2 {
+				var timestamp int64
+				fmt.Sscanf(parts[1], "%d", &timestamp)
+				return timestamp
+			}
+		}
+	}
+	return 0
 }
 
 // GetRemoteInfo retrieves detailed information about a specific remote
@@ -299,8 +355,8 @@ func makeRemoteRequest(remoteURL, endpoint string, method string, data interface
 		Timeout: DefaultTimeout,
 	}
 
-	// Prepare URL
-	apiURL := fmt.Sprintf("%s/api/%s/%s", remoteURL, ApiVersion, endpoint)
+	// Prepare URL - remoteURL already includes /api/username/repo
+	apiURL := fmt.Sprintf("%s/%s", remoteURL, endpoint)
 
 	var body io.Reader
 	if data != nil {
@@ -391,4 +447,88 @@ func prune(repoRoot, remoteName string) error {
 
 		return nil
 	})
+}
+
+// MergeRemoteBranch merges a remote branch into the current local branch
+func MergeRemoteBranch(repoRoot, remoteName, remoteBranch string, interactive bool) error {
+	// Validate repository
+	vecDir := filepath.Join(repoRoot, ".vec")
+	if _, err := os.Stat(vecDir); os.IsNotExist(err) {
+		return fmt.Errorf("not a vec repository: %s", repoRoot)
+	}
+
+	// Load config to get remote info
+	cfg, err := config.LoadConfig(repoRoot)
+	if err != nil {
+		return fmt.Errorf("failed to load config: %w", err)
+	}
+
+	// Verify the remote exists
+	_, err = cfg.GetRemoteURL(remoteName)
+	if err != nil {
+		return fmt.Errorf("remote '%s' not found: %w", remoteName, err)
+	}
+
+	// Check if the remote branch exists
+	remoteBranchPath := filepath.Join(vecDir, "refs", "remotes", remoteName, remoteBranch)
+	if _, err := os.Stat(remoteBranchPath); os.IsNotExist(err) {
+		return fmt.Errorf("remote branch '%s/%s' not found, try fetching first", remoteName, remoteBranch)
+	}
+
+	// Get the current branch
+	currentBranch, err := merge.GetCurrentBranch(repoRoot)
+	if err != nil {
+		return fmt.Errorf("failed to determine current branch: %w", err)
+	}
+
+	// Create a temporary branch name for the remote branch
+	tempBranchName := fmt.Sprintf("MERGE_HEAD_%s_%s", remoteName, remoteBranch)
+
+	// Read the remote branch commit hash
+	remoteCommitBytes, err := os.ReadFile(remoteBranchPath)
+	if err != nil {
+		return fmt.Errorf("failed to read remote branch commit: %w", err)
+	}
+
+	// Create a temporary ref for the merge
+	tempRefPath := filepath.Join(vecDir, "refs", "heads", tempBranchName)
+	if err := os.MkdirAll(filepath.Dir(tempRefPath), 0755); err != nil {
+		return fmt.Errorf("failed to create temporary ref directory: %w", err)
+	}
+	if err := os.WriteFile(tempRefPath, remoteCommitBytes, 0644); err != nil {
+		return fmt.Errorf("failed to create temporary ref: %w", err)
+	}
+
+	// Clean up the temporary branch when we're done
+	defer os.Remove(tempRefPath)
+
+	// Set up merge configuration
+	mergeConfig := &merge.MergeConfig{
+		Strategy:    merge.MergeStrategyRecursive,
+		Interactive: interactive,
+	}
+
+	// Perform the merge
+	fmt.Printf("Merging remote branch '%s/%s' into local branch '%s'\n",
+		remoteName, remoteBranch, currentBranch)
+
+	hasConflicts, err := merge.Merge(repoRoot, tempBranchName, mergeConfig)
+	if err != nil {
+		if strings.Contains(err.Error(), "already up-to-date") {
+			fmt.Printf("Branch '%s' is already up-to-date with '%s/%s'\n",
+				currentBranch, remoteName, remoteBranch)
+			return nil
+		}
+		return fmt.Errorf("merge failed: %w", err)
+	}
+
+	if hasConflicts {
+		fmt.Printf("Merge conflicts between '%s' and '%s/%s'. Please resolve and commit.\n",
+			currentBranch, remoteName, remoteBranch)
+		return nil
+	}
+
+	fmt.Printf("Successfully merged '%s/%s' into '%s'\n",
+		remoteName, remoteBranch, currentBranch)
+	return nil
 }

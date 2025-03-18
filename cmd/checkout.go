@@ -297,11 +297,11 @@ func createIndexFromTree(repoRoot string, tree *objects.TreeObject, basePath str
 }
 
 func updateReflog(repoRoot, prevCommitID, newCommitID, ref, action, details string) error {
-	authorName, err := utils.GetConfigValue(repoRoot, "user.name")
+	authorName, err := GetCascadingConfigValue("user.name")
 	if err != nil || authorName == "" {
 		authorName = "unknown"
 	}
-	authorEmail, err := utils.GetConfigValue(repoRoot, "user.email")
+	authorEmail, err := GetCascadingConfigValue("user.email")
 	if err != nil || authorEmail == "" {
 		authorEmail = "unknown"
 	}

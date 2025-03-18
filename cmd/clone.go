@@ -1,4 +1,3 @@
-// cmd/clone.go
 package cmd
 
 import (
@@ -37,8 +36,8 @@ If no directory is specified, the repository name will be used.`,
 				os.Exit(1)
 			}
 
-			// Remove .git suffix if present
-			if filepath.Ext(destPath) == ".git" {
+			// Remove .vec suffix if present
+			if filepath.Ext(destPath) == ".vec" {
 				destPath = destPath[:len(destPath)-4]
 			}
 		}
@@ -64,7 +63,7 @@ func init() {
 // extractRepoName derives a directory name from the remote URL
 func extractRepoName(remoteURL string) string {
 	parts := strings.Split(remoteURL, "/")
-	name := strings.TrimSuffix(parts[len(parts)-1], ".git")
+	name := strings.TrimSuffix(parts[len(parts)-1], ".vec")
 	if name == "" {
 		return "vec-repo"
 	}

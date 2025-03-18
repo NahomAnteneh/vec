@@ -60,7 +60,8 @@ func (t *TreeObject) Serialize() ([]byte, error) {
 		}
 
 		// Mode as 6-digit octal string
-		modeStr := fmt.Sprintf("%06o", entry.Mode)
+		modeStr := fmt.Sprintf("%06d", entry.Mode)
+
 		hashBytes, err := hex.DecodeString(entry.Hash)
 		if err != nil {
 			return nil, fmt.Errorf("invalid hash '%s' for entry '%s': %w", entry.Hash, entry.Name, err)
@@ -114,7 +115,7 @@ func DeserializeTreeObject(data []byte) (*TreeObject, error) {
 		pos += 32
 
 		// Parse mode and infer type
-		mode, err := strconv.ParseInt(modeStr, 8, 32)
+		mode, err := strconv.ParseInt(modeStr, 10, 32)
 		if err != nil {
 			return nil, fmt.Errorf("invalid mode '%s' for entry '%s': %w", modeStr, name, err)
 		}
@@ -130,6 +131,8 @@ func DeserializeTreeObject(data []byte) (*TreeObject, error) {
 			Type: entryType,
 		})
 	}
+
+	tree.SetTreeID()
 
 	return tree, nil
 }
@@ -169,7 +172,8 @@ func CreateTreeObject(entries []TreeEntry) (string, error) {
 		if len(entry.Hash) != 64 {
 			return "", fmt.Errorf("invalid hash length for entry '%s': expected 64, got %d", entry.Name, len(entry.Hash))
 		}
-		modeStr := fmt.Sprintf("%06o", entry.Mode)
+		modeStr := fmt.Sprintf("%06d", entry.Mode)
+
 		hashBytes, err := hex.DecodeString(entry.Hash)
 		if err != nil {
 			return "", fmt.Errorf("invalid hash '%s' for entry '%s': %w", entry.Hash, entry.Name, err)
@@ -315,7 +319,7 @@ func BuildTreeRecursively(dirPath string, treeMap map[string][]TreeEntry, repoRo
 		}
 		// Append the subtree as a tree entry.
 		entries = append(entries, TreeEntry{
-			Mode: 040000,
+			Mode: int32(040000),
 			Name: subDir,
 			Hash: subTreeHash,
 			Type: "tree",

@@ -175,4 +175,3 @@ func TestCreateRepositoryBareNonEmptyDir(t *testing.T) {
 		t.Errorf("Expected error when creating bare repository in non-empty directory, but got nil")
 	}
 }
-

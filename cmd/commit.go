@@ -42,15 +42,17 @@ func commit(repoRoot, message string) error {
 		return fmt.Errorf("nothing to commit, working tree clean")
 	}
 
-	// Retrieve author and committer info from config
-	authorName, err := utils.GetConfigValue(repoRoot, "user.name")
+	// Retrieve author and committer info from config using the cascading approach
+	authorName, err := GetCascadingConfigValue("user.name")
 	if err != nil || authorName == "" {
-		return fmt.Errorf("author name not configured; set it with 'vec config user.name <name>'")
+		return fmt.Errorf("author name not configured; set it with 'vec config user.name <n>'")
 	}
-	authorEmail, err := utils.GetConfigValue(repoRoot, "user.email")
+
+	authorEmail, err := GetCascadingConfigValue("user.email")
 	if err != nil || authorEmail == "" {
 		return fmt.Errorf("author email not configured; set it with 'vec config user.email <email>'")
 	}
+
 	author := fmt.Sprintf("%s <%s>", authorName, authorEmail)
 	committer := author // For simplicity, assume committer is the same as author
 

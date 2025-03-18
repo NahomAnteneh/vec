@@ -134,7 +134,7 @@ func CreateCommit(repoRoot, treeHash string, parentHashes []string, author, comm
 	}
 
 	// Prepend the header
-	header := fmt.Sprintf("commit %d\n", len(data))
+	header := fmt.Sprintf("commit %d\x00", len(data))
 	var buf bytes.Buffer
 	buf.WriteString(header)
 	buf.Write(data)
@@ -166,7 +166,7 @@ func GetCommit(repoRoot string, hash string) (*Commit, error) {
 	}
 
 	// Find the header end
-	headerEnd := bytes.IndexByte(content, '\n')
+	headerEnd := bytes.IndexByte(content, '\x00')
 	if headerEnd == -1 {
 		return nil, fmt.Errorf("invalid commit format: missing header")
 	}

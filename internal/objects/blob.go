@@ -12,7 +12,7 @@ import (
 
 // CreateBlob creates a new blob object, including the header.
 func CreateBlob(repoRoot string, content []byte) (string, error) {
-	header := fmt.Sprintf("blob %d\n", len(content))
+	header := fmt.Sprintf("blob %d\x00", len(content))
 	var buf bytes.Buffer
 	buf.WriteString(header)
 	buf.Write(content)
@@ -57,7 +57,7 @@ func GetBlob(repoRoot string, hash string) ([]byte, error) {
 	}
 
 	// Separate header and content
-	headerEnd := bytes.IndexByte(content, '\n')
+	headerEnd := bytes.IndexByte(content, '\x00')
 	if headerEnd == -1 {
 		return nil, fmt.Errorf("invalid blob format: missing header")
 	}

@@ -2,51 +2,76 @@ package cmd
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/NahomAnteneh/vec/internal/merge"
+	"github.com/NahomAnteneh/vec/internal/remote"
 	"github.com/NahomAnteneh/vec/utils"
 	"github.com/spf13/cobra"
 )
 
 var (
-	mergeStrategy string
-	interactive   bool
+	mergeStrategy    string
+	mergeInteractive bool
+	mergeNoCommit    bool
 )
 
-// mergeCmd defines the "merge" command for the vec CLI.
+// mergeCmd represents the merge command
 var mergeCmd = &cobra.Command{
-	Use:   "merge <branch>",
-	Short: "Join two or more development histories together",
-	Long: `Merge integrates changes from the specified branch into the current branch.
-It supports fast-forward merges when possible and performs a three-way merge
-otherwise, handling conflicts by marking them in the working directory and index.
-Resolve conflicts manually and commit the result to complete the merge.`,
-	Args: cobra.ExactArgs(1), // Requires exactly one argument: the branch to merge from
+	Use:   "merge [branch-name]",
+	Short: "Merge another branch into the current branch",
+	Long: `Merge another branch into the current branch.
+This combines the specified branch's history with the current branch.
+
+Examples:
+  vec merge feature-branch         # Merge local branch 'feature-branch' into current branch
+  vec merge origin/main            # Merge remote branch 'main' from remote 'origin'
+  vec merge --strategy=ours topic  # Merge branch 'topic' using the 'ours' strategy`,
+	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		// Get the repository root.
+		// Get the repository root
 		repoRoot, err := utils.GetVecRoot()
 		if err != nil {
 			return fmt.Errorf("failed to find repository root: %w", err)
 		}
 
-		// Get the source branch from arguments.
-		sourceBranch := args[0]
+		// Get the branch to merge
+		branchName := args[0]
 
-		// Build merge configuration based on flags.
+		// Check if this is a remote branch
+		if strings.Contains(branchName, "/") {
+			parts := strings.SplitN(branchName, "/", 2)
+			if len(parts) == 2 {
+				remoteName := parts[0]
+				remoteBranch := parts[1]
+
+				return remote.MergeRemoteBranch(repoRoot, remoteName, remoteBranch, mergeInteractive)
+			}
+		}
+
+		// Otherwise, treat as a local branch
+		var strategy merge.MergeStrategy
+		switch mergeStrategy {
+		case "ours":
+			strategy = merge.MergeStrategyOurs
+		case "theirs":
+			strategy = merge.MergeStrategyTheirs
+		default:
+			strategy = merge.MergeStrategyRecursive
+		}
+
 		config := &merge.MergeConfig{
-			Strategy:    merge.MergeStrategy(mergeStrategy),
-			Interactive: interactive,
+			Strategy:    strategy,
+			Interactive: mergeInteractive,
 		}
 
-		// Perform the merge.
-		hasConflicts, err := merge.Merge(repoRoot, sourceBranch, config)
+		hasConflicts, err := merge.Merge(repoRoot, branchName, config)
 		if err != nil {
-			return fmt.Errorf("merge failed: %w", err)
+			return err
 		}
 
-		// Provide feedback based on merge outcome.
 		if hasConflicts {
-			fmt.Println("Merge encountered conflicts. Resolve them and run 'vec commit' to complete the merge.")
+			fmt.Println("Merge conflicts detected. Please resolve and commit.")
 		}
 
 		return nil
@@ -55,6 +80,8 @@ Resolve conflicts manually and commit the result to complete the merge.`,
 
 func init() {
 	rootCmd.AddCommand(mergeCmd)
-	mergeCmd.Flags().StringVarP(&mergeStrategy, "strategy", "s", "recursive", "Merge strategy to use (recursive, ours, theirs)")
-	mergeCmd.Flags().BoolVarP(&interactive, "interactive", "i", false, "Prompt interactively to resolve conflicts")
+
+	mergeCmd.Flags().StringVar(&mergeStrategy, "strategy", "recursive", "Merge strategy: recursive, ours, or theirs")
+	mergeCmd.Flags().BoolVar(&mergeInteractive, "interactive", false, "Resolve conflicts interactively")
+	mergeCmd.Flags().BoolVar(&mergeNoCommit, "no-commit", false, "Don't automatically commit the merge")
 }
