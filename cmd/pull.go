@@ -39,7 +39,7 @@ If no branch is specified, the current branch is used.`,
 		}
 
 		// Pull from remote
-		if err := remote.Pull(repoRoot, remoteName, branchName); err != nil {
+		if err := remote.Pull(repoRoot, remoteName, branchName, false); err != nil {
 			fmt.Printf("Error: %s\n", err)
 			os.Exit(1)
 		}

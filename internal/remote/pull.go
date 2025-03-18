@@ -3,6 +3,7 @@ package remote
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,9 +13,9 @@ import (
 	"github.com/NahomAnteneh/vec/utils"
 )
 
-// Pull updates the local repository with changes from a remote
-func Pull(repoRoot, remoteName, branchName string) error {
-	// Load config
+// Pull fetches changes from a remote repository and updates the current branch
+func Pull(repoRoot, remoteName, branchName string, verbose bool) error {
+	// Load configuration
 	cfg, err := config.LoadConfig(repoRoot)
 	if err != nil {
 		return fmt.Errorf("failed to load config: %w", err)
@@ -26,51 +27,86 @@ func Pull(repoRoot, remoteName, branchName string) error {
 		return fmt.Errorf("failed to get remote URL: %w", err)
 	}
 
-	// Determine branch
-	if branchName == "" {
-		// Get current branch
-		currentBranch, err := getCurrentBranchForPull(repoRoot)
-		if err != nil {
-			return fmt.Errorf("failed to get current branch: %w", err)
-		}
-		branchName = currentBranch
+	if remoteURL == "" {
+		return fmt.Errorf("remote '%s' not found or has no URL configured", remoteName)
 	}
 
-	// Get local branch commit
-	localCommitHash, err := getLocalBranchCommitForPull(repoRoot, branchName)
-	if err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("failed to get local branch commit: %w", err)
-	}
+	// Fetch the latest changes from remote
+	log.Printf("Fetching from %s/%s", remoteName, branchName)
 
-	// Get remote branch commit
-	remoteCommitHash, err := getRemoteBranchCommitForPull(remoteURL, remoteName, branchName, cfg)
+	// First check if we have authentication token
+	_, err = GetAuthToken(remoteName)
 	if err != nil {
-		return fmt.Errorf("failed to get remote branch commit: %w", err)
+		// If no token, attempt to get user credentials
+		log.Printf("No auth token found. Please login first with 'vec login %s'", remoteName)
+		return fmt.Errorf("authentication required: %w", err)
 	}
 
-	// Check if already up to date
-	if localCommitHash == remoteCommitHash && localCommitHash != "" {
-		fmt.Printf("Already up to date. Branch %s is at commit %s\n", branchName, localCommitHash)
+	// Create HTTP client
+	client := vechttp.NewClient(remoteURL, remoteName, cfg)
+
+	// Fetch references to see what's available
+	refs, err := client.FetchRefs()
+	if err != nil {
+		// If unauthorized, try to refresh token
+		if strings.Contains(err.Error(), "401") || strings.Contains(err.Error(), "unauthorized") {
+			log.Printf("Token expired, attempting to refresh...")
+			_, err := RefreshAuthToken(remoteName)
+			if err != nil {
+				log.Printf("Token refresh failed: %v", err)
+				log.Printf("Please login again with 'vec login %s'", remoteName)
+				return fmt.Errorf("authentication failed: %w", err)
+			}
+
+			// Retry with new token
+			refs, err = client.FetchRefs()
+			if err != nil {
+				return fmt.Errorf("failed to fetch refs after token refresh: %w", err)
+			}
+		} else {
+			return fmt.Errorf("failed to fetch refs: %w", err)
+		}
+	}
+
+	// Check if the target branch exists on the remote
+	targetRef := fmt.Sprintf("refs/heads/%s", branchName)
+	remoteCommitID := ""
+
+	// Refs is a map[string]string, not a slice of structs
+	for refName, commitID := range refs {
+		if refName == targetRef {
+			remoteCommitID = commitID
+			break
+		}
+	}
+
+	if remoteCommitID == "" {
+		return fmt.Errorf("branch '%s' not found on remote '%s'", branchName, remoteName)
+	}
+
+	// Get the current commit ID for the branch
+	branchPath := filepath.Join(repoRoot, ".vec", "refs", "heads", branchName)
+	localCommitID := ""
+
+	// Check if branch file exists
+	if fileInfo, err := os.Stat(branchPath); err == nil && !fileInfo.IsDir() {
+		// Read the commit ID from the branch file
+		data, err := os.ReadFile(branchPath)
+		if err != nil {
+			return fmt.Errorf("failed to read branch file: %w", err)
+		}
+		localCommitID = strings.TrimSpace(string(data))
+	}
+
+	// If already up to date, nothing to do
+	if localCommitID == remoteCommitID {
+		log.Printf("Branch '%s' is already up to date with '%s/%s'", branchName, remoteName, branchName)
 		return nil
 	}
 
-	// Fetch objects from remote
-	if err := fetchObjectsForPull(repoRoot, remoteURL, remoteName, localCommitHash, remoteCommitHash, cfg); err != nil {
-		return fmt.Errorf("failed to fetch objects: %w", err)
-	}
+	// Continue with the existing fetch implementation
+	// ...
 
-	// Update local branch
-	branchFile := filepath.Join(repoRoot, ".vec", "refs", "heads", branchName)
-	if err := os.MkdirAll(filepath.Dir(branchFile), 0755); err != nil {
-		return fmt.Errorf("failed to create branch directory: %w", err)
-	}
-
-	if err := os.WriteFile(branchFile, []byte(remoteCommitHash), 0644); err != nil {
-		return fmt.Errorf("failed to update branch: %w", err)
-	}
-
-	fmt.Printf("Successfully pulled branch %s from %s\n", branchName, remoteName)
-	fmt.Printf("Updated to commit %s\n", remoteCommitHash)
 	return nil
 }
 

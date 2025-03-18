@@ -406,3 +406,100 @@ func (c *Client) Push(pushData map[string]interface{}, packfile []byte) (*PushRe
 
 	return &pushResult, nil
 }
+
+// Login performs authentication with the server
+func (c *Client) Login(username, password string) (string, string, error) {
+	// Prepare login request
+	loginReq := map[string]string{
+		"username": username,
+		"password": password,
+	}
+
+	// Make request
+	result, err := c.sendRequest("POST", "auth/login", loginReq)
+	if err != nil {
+		return "", "", fmt.Errorf("login request failed: %w", err)
+	}
+	defer result.Response.Body.Close()
+
+	if result.Error != nil {
+		return "", "", result.Error
+	}
+
+	// Parse response
+	var loginResp struct {
+		Token        string `json:"token"`
+		RefreshToken string `json:"refresh_token"`
+		ExpiresIn    int    `json:"expires_in"`
+	}
+
+	body, err := io.ReadAll(result.Response.Body)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to read login response: %w", err)
+	}
+
+	if err := json.Unmarshal(body, &loginResp); err != nil {
+		return "", "", fmt.Errorf("failed to parse login response: %w", err)
+	}
+
+	if loginResp.Token == "" {
+		return "", "", fmt.Errorf("server returned empty token")
+	}
+
+	if c.verbose {
+		log.Printf("Successfully authenticated with server")
+		if loginResp.ExpiresIn > 0 {
+			log.Printf("Token expires in %d seconds", loginResp.ExpiresIn)
+		}
+	}
+
+	return loginResp.Token, loginResp.RefreshToken, nil
+}
+
+// RefreshToken attempts to refresh an expired token
+func (c *Client) RefreshToken(refreshToken string) (string, string, error) {
+	// Prepare refresh request
+	refreshReq := map[string]string{
+		"refresh_token": refreshToken,
+	}
+
+	// Make request
+	result, err := c.sendRequest("POST", "auth/refresh", refreshReq)
+	if err != nil {
+		return "", "", fmt.Errorf("token refresh request failed: %w", err)
+	}
+	defer result.Response.Body.Close()
+
+	if result.Error != nil {
+		return "", "", result.Error
+	}
+
+	// Parse response
+	var refreshResp struct {
+		Token        string `json:"token"`
+		RefreshToken string `json:"refresh_token"`
+		ExpiresIn    int    `json:"expires_in"`
+	}
+
+	body, err := io.ReadAll(result.Response.Body)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to read refresh response: %w", err)
+	}
+
+	if err := json.Unmarshal(body, &refreshResp); err != nil {
+		return "", "", fmt.Errorf("failed to parse refresh response: %w", err)
+	}
+
+	if refreshResp.Token == "" {
+		return "", "", fmt.Errorf("server returned empty token")
+	}
+
+	if c.verbose {
+		log.Printf("Successfully refreshed authentication token")
+		if refreshResp.ExpiresIn > 0 {
+			log.Printf("New token expires in %d seconds", refreshResp.ExpiresIn)
+		}
+	}
+
+	return refreshResp.Token, refreshResp.RefreshToken, nil
+}
