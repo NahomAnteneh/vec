@@ -2,7 +2,6 @@
 package remote
 
 import (
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,6 +13,7 @@ import (
 
 	"github.com/NahomAnteneh/vec/internal/config"
 	"github.com/NahomAnteneh/vec/internal/objects"
+	vechttp "github.com/NahomAnteneh/vec/internal/remote/http"
 	"github.com/NahomAnteneh/vec/utils"
 )
 
@@ -32,17 +32,20 @@ type PushOptions struct {
 	Verbose bool
 	// Timeout specifies the maximum time for the entire push operation
 	Timeout time.Duration
-	// IncludeTags determines whether to also push tags pointing to the pushed commits
-	IncludeTags bool
+	// DryRun simulates a push without actually sending any data
+	DryRun bool
+	// Progress indicates whether to show progress information
+	Progress bool
 }
 
 // DefaultPushOptions returns the default options for push operations
 func DefaultPushOptions() PushOptions {
 	return PushOptions{
-		Force:       false,
-		Verbose:     false,
-		Timeout:     5 * time.Minute,
-		IncludeTags: false,
+		Force:    false,
+		Verbose:  false,
+		Timeout:  5 * time.Minute,
+		DryRun:   false,
+		Progress: true,
 	}
 }
 
@@ -129,17 +132,19 @@ func PushWithOptions(repoRoot, remoteName, branchName string, options PushOption
 		return nil
 	}
 
-	// Include tags if requested
-	if options.IncludeTags {
-		tagObjects, err := getTagsForPush(repoRoot, objectsToSend)
-		if err != nil {
-			return fmt.Errorf("failed to get tag objects: %w", err)
+	// Early return for dry run mode
+	if options.DryRun {
+		if options.Verbose {
+			fmt.Printf("Dry run: Would push %d objects to update branch %s on remote %s\n",
+				len(objectsToSend), branchName, remoteName)
+			fmt.Printf("Dry run: Would update remote ref from %s to %s\n",
+				formatCommitHash(remoteCommitHash), formatCommitHash(localCommitHash))
 		}
-		objectsToSend = append(objectsToSend, tagObjects...)
+		return nil
 	}
 
 	// Create packfile
-	if options.Verbose {
+	if options.Progress || options.Verbose {
 		fmt.Printf("Creating packfile with %d objects...\n", len(objectsToSend))
 	}
 
@@ -161,7 +166,7 @@ func PushWithOptions(repoRoot, remoteName, branchName string, options PushOption
 		Timeout: options.Timeout,
 	}
 
-	if options.Verbose {
+	if options.Progress || options.Verbose {
 		fmt.Println("Sending packfile to remote...")
 	}
 
@@ -176,10 +181,25 @@ func PushWithOptions(repoRoot, remoteName, branchName string, options PushOption
 
 	if options.Verbose {
 		fmt.Printf("Successfully pushed branch %s to %s\n", branchName, remoteName)
-	} else {
+		if len(result.Message) > 0 {
+			fmt.Printf("Server message: %s\n", result.Message)
+		}
+	} else if options.Progress {
 		fmt.Printf("Successfully pushed branch %s to %s\n", branchName, remoteName)
 	}
+
 	return nil
+}
+
+// formatCommitHash formats a commit hash for display
+func formatCommitHash(hash string) string {
+	if hash == "" {
+		return "new ref"
+	}
+	if len(hash) > 8 {
+		return hash[:8]
+	}
+	return hash
 }
 
 // getCurrentBranch gets the name of the current branch
@@ -219,7 +239,7 @@ func getLocalBranchCommit(repoRoot, branchName string) (string, error) {
 
 // getRemoteBranchCommit gets the commit hash of a remote branch
 func getRemoteBranchCommit(remoteURL, remoteName, branchName string, cfg *config.Config) (string, error) {
-	endpoint := fmt.Sprintf("refs/heads/%s", branchName)
+	endpoint := fmt.Sprintf("branches/%s", branchName)
 	resp, err := makeRemoteRequest(remoteURL, endpoint, "GET", nil, cfg, remoteName)
 	if err != nil {
 		return "", err
@@ -439,39 +459,36 @@ func createPackfile(repoRoot string, objectHashes []string) ([]byte, error) {
 	return packfileData, nil
 }
 
+// convertPushResult converts a vechttp.PushResult to a local PushResult
+func convertPushResult(result *vechttp.PushResult) *PushResult {
+	if result == nil {
+		return nil
+	}
+
+	return &PushResult{
+		Success: result.Success,
+		Message: result.Message,
+		Errors:  result.Errors,
+	}
+}
+
 // performPushWithClient sends the packfile and updates refs on the remote using the provided HTTP client
 func performPushWithClient(remoteURL, remoteName string, pushData map[string]interface{}, packfile []byte, cfg *config.Config, client *http.Client) (*PushResult, error) {
-	if client == nil {
-		client = &http.Client{Timeout: 30 * time.Second}
-	}
-
-	endpoint := "push"
-
-	// Convert packfile to base64 string to ensure proper JSON encoding
-	pushData["packfile"] = base64.StdEncoding.EncodeToString(packfile)
-
-	resp, err := makeRemoteRequest(remoteURL, endpoint, "POST", pushData, cfg, remoteName)
+	// Ignore the client parameter and use our centralized client instead
+	result, err := vechttp.PerformPush(remoteURL, remoteName, pushData, packfile, cfg)
 	if err != nil {
-		return nil, fmt.Errorf("push request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	var result PushResult
-	if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		result.Success = false
-		result.Message = fmt.Sprintf("Server returned status %d: %s", resp.StatusCode, string(bodyBytes))
-		return &result, nil
+		return nil, err
 	}
 
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("failed to decode push response: %w", err)
-	}
-
-	return &result, nil
+	return convertPushResult(result), nil
 }
 
 // performPush sends the packfile and updates refs on the remote
 func performPush(remoteURL, remoteName string, pushData map[string]interface{}, packfile []byte, cfg *config.Config) (*PushResult, error) {
-	return performPushWithClient(remoteURL, remoteName, pushData, packfile, cfg, nil)
+	result, err := vechttp.PerformPush(remoteURL, remoteName, pushData, packfile, cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	return convertPushResult(result), nil
 }

@@ -18,24 +18,32 @@ This command performs several housekeeping tasks:
 1. Removes unreferenced objects older than a specified time
 2. Optionally packs loose objects into packfiles to save space
 3. Optionally prunes old packfiles no longer referenced by the repository
-4. With the --dry-run option, shows what would be done without making changes
+4. Optionally packs referenced objects for better storage efficiency
+5. Optionally repacks existing packfiles for better compression
+6. With the --dry-run option, shows what would be done without making changes
 
 Example:
-  vec gc                   # Run garbage collection with default settings
-  vec gc -p                # Run garbage collection and prune old packfiles
-  vec gc -a                # Automatically pack loose objects into packfiles
-  vec gc -v                # Run with verbose output
-  vec gc -n                # Dry run (show what would happen without making changes)
-  vec gc -a -p -v          # Full cleanup with verbose output
+  vec gc                     # Run garbage collection with default settings
+  vec gc -p                  # Run garbage collection and prune old packfiles
+  vec gc -a                  # Automatically pack loose objects into packfiles
+  vec gc -v                  # Run with verbose output
+  vec gc -n                  # Dry run (show what would happen without making changes)
+  vec gc -a -p -v            # Full cleanup with verbose output
+  vec gc --pack-all          # Pack both unreferenced and referenced objects
+  vec gc --repack            # Repack existing packfiles for better compression
+  vec gc --age-threshold=30  # Consider objects older than 30 days as candidates for packing
 `,
 	RunE: runGC,
 }
 
 var (
-	gcPrune    bool
-	gcAutoPack bool
-	gcDryRun   bool
-	gcVerbose  bool
+	gcPrune        bool
+	gcAutoPack     bool
+	gcDryRun       bool
+	gcVerbose      bool
+	gcPackAll      bool
+	gcRepack       bool
+	gcAgeThreshold int
 )
 
 func init() {
@@ -44,8 +52,11 @@ func init() {
 	// Add flags
 	gcCmd.Flags().BoolVarP(&gcPrune, "prune", "p", false, "Prune loose objects and redundant packfiles")
 	gcCmd.Flags().BoolVarP(&gcAutoPack, "auto-pack", "a", false, "Automatically pack loose objects into packfiles")
-	gcCmd.Flags().BoolVarP(&gcDryRun, "dry-run", "n", false, "Show what would be removed without actually removing anything")
+	gcCmd.Flags().BoolVarP(&gcDryRun, "dry-run", "n", false, "Show what would be done without actually removing anything")
 	gcCmd.Flags().BoolVarP(&gcVerbose, "verbose", "v", false, "Show detailed information about the garbage collection process")
+	gcCmd.Flags().BoolVar(&gcPackAll, "pack-all", false, "Pack both unreferenced and referenced objects (more aggressive packing)")
+	gcCmd.Flags().BoolVar(&gcRepack, "repack", false, "Repack existing packfiles for better compression")
+	gcCmd.Flags().IntVar(&gcAgeThreshold, "age-threshold", 14, "Age threshold in days for considering objects as old enough to pack")
 }
 
 func runGC(cmd *cobra.Command, args []string) error {
@@ -57,11 +68,14 @@ func runGC(cmd *cobra.Command, args []string) error {
 
 	// Create options for garbage collection
 	options := maintenance.GarbageCollectOptions{
-		RepoRoot: repoRoot,
-		Prune:    gcPrune,
-		AutoPack: gcAutoPack,
-		DryRun:   gcDryRun,
-		Verbose:  gcVerbose,
+		RepoRoot:           repoRoot,
+		Prune:              gcPrune,
+		AutoPack:           gcAutoPack,
+		DryRun:             gcDryRun,
+		Verbose:            gcVerbose,
+		PackAll:            gcPackAll,
+		Repack:             gcRepack,
+		OldObjectThreshold: gcAgeThreshold,
 	}
 
 	// Run garbage collection
@@ -84,6 +98,14 @@ func runGC(cmd *cobra.Command, args []string) error {
 
 	if stats.ObjectsPacked > 0 || gcDryRun {
 		fmt.Printf("- Packed %d loose objects into packfiles\n", stats.ObjectsPacked)
+	}
+
+	if stats.ReferencedObjectsPacked > 0 || (gcDryRun && gcPackAll) {
+		fmt.Printf("- Packed %d referenced objects\n", stats.ReferencedObjectsPacked)
+	}
+
+	if stats.PackfilesRepacked > 0 || (gcDryRun && gcRepack) {
+		fmt.Printf("- Repacked %d packfiles\n", stats.PackfilesRepacked)
 	}
 
 	if stats.PackfilesPruned > 0 || gcDryRun {

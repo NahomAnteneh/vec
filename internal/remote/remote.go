@@ -1,11 +1,8 @@
 package remote
 
 import (
-	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -14,6 +11,7 @@ import (
 
 	"github.com/NahomAnteneh/vec/internal/config"
 	"github.com/NahomAnteneh/vec/internal/merge"
+	vechttp "github.com/NahomAnteneh/vec/internal/remote/http"
 	"github.com/NahomAnteneh/vec/utils"
 )
 
@@ -350,51 +348,40 @@ func listRemoteBranches(repoRoot, remoteName string) ([]string, error) {
 }
 
 // makeRemoteRequest performs an HTTP request to a remote repository
+// This is now a wrapper that delegates to the centralized HTTP client
 func makeRemoteRequest(remoteURL, endpoint string, method string, data interface{}, cfg *config.Config, remoteName string) (*http.Response, error) {
-	client := &http.Client{
-		Timeout: DefaultTimeout,
-	}
+	// Use the new centralized HTTP client
+	return vechttp.MakeRemoteRequest(remoteURL, endpoint, method, data, cfg, remoteName)
+}
 
-	// Prepare URL - remoteURL already includes /api/username/repo
-	apiURL := fmt.Sprintf("%s/%s", remoteURL, endpoint)
-
-	var body io.Reader
-	if data != nil {
-		jsonData, err := json.Marshal(data)
-		if err != nil {
-			return nil, fmt.Errorf("failed to marshal request data: %w", err)
+// logRequestInfo logs non-sensitive information about the request
+func logRequestInfo(req *http.Request) {
+	// Don't log in production builds, just for development
+	// Remove or comment out these lines in production
+	fmt.Printf("Request: %s %s\n", req.Method, req.URL.String())
+	fmt.Println("Headers:")
+	for name, values := range req.Header {
+		// Don't log the full authorization token for security reasons
+		if strings.ToLower(name) == "authorization" {
+			fmt.Printf("  %s: Bearer [TOKEN REDACTED]\n", name)
+		} else {
+			fmt.Printf("  %s: %s\n", name, values)
 		}
-		body = bytes.NewBuffer(jsonData)
 	}
-
-	// Create request
-	req, err := http.NewRequest(method, apiURL, body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create HTTP request: %w", err)
+	if req.Body != nil {
+		fmt.Println("Body: [CONTENT NOT LOGGED]")
 	}
+}
 
-	// Set headers
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "Vec-Client/0.1")
-
-	// Add authentication if available
-	if err := ApplyAuthHeaders(req, remoteName, cfg); err != nil {
-		return nil, fmt.Errorf("failed to apply auth headers: %w", err)
+// logResponseInfo logs information about the response
+func logResponseInfo(resp *http.Response, message string) {
+	// Don't log in production builds, just for development
+	// Remove or comment out these lines in production
+	statusMsg := fmt.Sprintf("Response: %d %s", resp.StatusCode, resp.Status)
+	if message != "" {
+		statusMsg += " - " + message
 	}
-
-	// Send request
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrNetworkError, err)
-	}
-
-	// Check for authentication errors
-	if resp.StatusCode == http.StatusUnauthorized {
-		resp.Body.Close()
-		return nil, ErrAuthenticationFailed
-	}
-
-	return resp, nil
+	fmt.Println(statusMsg)
 }
 
 // prune removes stale remote references
@@ -531,4 +518,16 @@ func MergeRemoteBranch(repoRoot, remoteName, remoteBranch string, interactive bo
 	fmt.Printf("Successfully merged '%s/%s' into '%s'\n",
 		remoteName, remoteBranch, currentBranch)
 	return nil
+}
+
+// ParseLastFetchedTime parses the timestamp from a fetch info file
+// This is an exported version of parseLastFetchedTime for use in commands
+func ParseLastFetchedTime(fetchInfo string) int64 {
+	return parseLastFetchedTime(fetchInfo)
+}
+
+// Prune removes stale remote references
+// This is an exported version of prune for use in commands
+func Prune(repoRoot, remoteName string) error {
+	return prune(repoRoot, remoteName)
 }

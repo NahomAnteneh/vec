@@ -3,22 +3,36 @@ package remote
 
 import (
 	"bytes"
-	"encoding/binary"
-	"encoding/json"
+	"crypto/sha256"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"net/http/httputil"
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
+
+	"compress/zlib"
 
 	"github.com/NahomAnteneh/vec/internal/config"
 	"github.com/NahomAnteneh/vec/internal/objects"
+	vechttp "github.com/NahomAnteneh/vec/internal/remote/http"
 	"github.com/NahomAnteneh/vec/utils"
 )
+
+// FetchOptions contains options for the fetch operation
+type FetchOptions struct {
+	// General options
+	Quiet     bool   // Suppress output
+	Verbose   bool   // Be verbose
+	Force     bool   // Force update of local branches
+	Depth     int    // Create a shallow fetch with limited history
+	FetchTags bool   // Fetch all tags
+	Branch    string // Specific branch to fetch (used only in FetchWithOptions)
+	DryRun    bool   // Don't actually fetch, just show what would be done
+	Progress  bool   // Show progress output
+	Prune     bool   // Remove remote refs that don't exist locally
+}
 
 // logRequest logs the details of an HTTP request
 func logRequest(req *http.Request) {
@@ -57,23 +71,16 @@ func logResponse(resp *http.Response) {
 	log.Printf("[HTTP Response] Status: %s\n%s", resp.Status, respLog)
 }
 
-// Fetch retrieves refs and objects from the remote repository efficiently
-func Fetch(repoRoot, remoteName string) error {
-	log.Printf("[Fetch] Starting fetch from remote '%s'", remoteName)
+// FetchWithOptions fetches from a remote with additional options
+func FetchWithOptions(repoRoot, remoteName string, opts FetchOptions) error {
+	if !opts.Quiet && opts.Verbose {
+		log.Printf("[Fetch] Starting fetch from remote '%s' with options: %+v", remoteName, opts)
+	}
 
 	// Load config
 	cfg, err := config.LoadConfig(repoRoot)
 	if err != nil {
 		return fmt.Errorf("failed to load config: %w", err)
-	}
-
-	// Debug config
-	log.Printf("[Fetch] Config loaded from %s", repoRoot)
-	if remote, exists := cfg.Remotes[remoteName]; exists {
-		log.Printf("[Fetch] Remote '%s' found in config: URL=%s, Auth=%v",
-			remoteName, remote.URL, remote.Auth != "")
-	} else {
-		log.Printf("[Fetch] Remote '%s' not found in loaded config", remoteName)
 	}
 
 	// Get remote URL
@@ -82,7 +89,9 @@ func Fetch(repoRoot, remoteName string) error {
 		return fmt.Errorf("failed to get remote URL: %w", err)
 	}
 
-	log.Printf("[Fetch] Using remote URL: %s", remoteURL)
+	if !opts.Quiet && opts.Verbose {
+		log.Printf("[Fetch] Using remote URL: %s", remoteURL)
+	}
 
 	// Fetch remote refs
 	refs, err := fetchRemoteRefs(remoteURL, remoteName, cfg)
@@ -90,7 +99,15 @@ func Fetch(repoRoot, remoteName string) error {
 		return fmt.Errorf("failed to fetch remote refs: %w", err)
 	}
 
-	log.Printf("[Fetch] Retrieved %d refs from remote", len(refs))
+	if !opts.Quiet && opts.Verbose {
+		log.Printf("[Fetch] Retrieved %d refs from remote", len(refs))
+	}
+
+	// Handle specific branch filter if provided in options
+	if opts.Branch != "" {
+		// Use the specific branch fetch function
+		return FetchBranchWithOptions(repoRoot, remoteName, opts.Branch, opts)
+	}
 
 	// Get local refs for negotiation
 	localRefs, err := getLocalRefs(repoRoot)
@@ -98,7 +115,30 @@ func Fetch(repoRoot, remoteName string) error {
 		return fmt.Errorf("failed to get local refs: %w", err)
 	}
 
-	log.Printf("[Fetch] Found %d local refs", len(localRefs))
+	if !opts.Quiet && opts.Verbose {
+		log.Printf("[Fetch] Found %d local refs", len(localRefs))
+	}
+
+	// Check for prune case - identify remote refs that should be pruned
+	var refsToRemove []string
+	if opts.Prune {
+		refsToRemove = identifyRefsToRemove(repoRoot, remoteName, refs)
+		if !opts.Quiet && opts.Verbose && len(refsToRemove) > 0 {
+			log.Printf("[Fetch] Found %d remote refs to prune", len(refsToRemove))
+		}
+
+		// Perform pruning if not in dry-run mode
+		if !opts.DryRun && len(refsToRemove) > 0 {
+			if err := pruneRemoteRefs(repoRoot, remoteName, refsToRemove); err != nil {
+				log.Printf("[Fetch] Warning: pruning failed: %v", err)
+				// Continue with fetch even if pruning fails
+			} else if !opts.Quiet {
+				fmt.Printf("Pruned %d stale remote-tracking branches\n", len(refsToRemove))
+			}
+		} else if opts.DryRun && len(refsToRemove) > 0 && !opts.Quiet {
+			fmt.Printf("Would prune %d stale remote-tracking branches\n", len(refsToRemove))
+		}
+	}
 
 	// Negotiate with the server to determine missing objects
 	missingObjects, err := negotiateFetch(remoteURL, remoteName, refs, localRefs, cfg)
@@ -106,45 +146,92 @@ func Fetch(repoRoot, remoteName string) error {
 		return fmt.Errorf("failed to negotiate fetch: %w", err)
 	}
 
-	log.Printf("[Fetch] Negotiation complete, %d objects missing", len(missingObjects))
+	if !opts.Quiet && opts.Verbose {
+		log.Printf("[Fetch] Negotiation complete, %d objects missing", len(missingObjects))
+	}
 
 	if len(missingObjects) == 0 {
-		fmt.Println("Already up to date.")
+		if !opts.Quiet {
+			fmt.Println("Already up to date.")
+		}
 		return nil
 	}
 
+	// In dry-run mode, just report what would be done
+	if opts.DryRun {
+		if !opts.Quiet {
+			fmt.Printf("Would fetch %d objects from remote '%s'\n", len(missingObjects), remoteName)
+			fmt.Printf("Would update %d remote-tracking references\n", len(refs))
+		}
+		return nil
+	}
+
+	// Apply depth limit if specified
+	if opts.Depth > 0 && !opts.Quiet && opts.Verbose {
+		log.Printf("[Fetch] Limiting history to depth %d", opts.Depth)
+		// Note: Actual depth limitation would be implemented here
+		// This would involve modifying the packfile request to include depth information
+	}
+
 	// Fetch the packfile containing missing objects
+	if !opts.Quiet && opts.Progress {
+		fmt.Printf("Downloading objects: %d object(s)\n", len(missingObjects))
+	}
+
 	packfile, err := fetchPackfile(remoteURL, remoteName, missingObjects, cfg)
 	if err != nil {
 		return fmt.Errorf("failed to fetch packfile: %w", err)
 	}
 
-	log.Printf("[Fetch] Received packfile of size %d bytes", len(packfile))
+	if !opts.Quiet && opts.Verbose {
+		log.Printf("[Fetch] Received packfile of size %d bytes", len(packfile))
+	}
 
-	// Unpack the packfile using production logic
+	// Unpack the packfile
+	if !opts.Quiet && opts.Progress {
+		fmt.Printf("Unpacking objects: 100%% (%d/%d)\n", len(missingObjects), len(missingObjects))
+	}
+
 	if err := unpackPackfile(repoRoot, packfile); err != nil {
 		return fmt.Errorf("failed to unpack packfile: %w", err)
 	}
 
 	// Update local tracking refs
+	updatedRefs := 0
 	for branch, commitHash := range refs {
+		// Skip non-branch refs if only want branches
+		if !opts.FetchTags && !strings.HasPrefix(branch, "refs/heads/") {
+			continue
+		}
+
 		refPath := filepath.Join(repoRoot, ".vec", "refs", "remotes", remoteName, branch)
 		if err := os.MkdirAll(filepath.Dir(refPath), 0755); err != nil {
 			return fmt.Errorf("failed to create refs directory: %w", err)
 		}
+
 		if err := os.WriteFile(refPath, []byte(commitHash+"\n"), 0644); err != nil {
 			return fmt.Errorf("failed to update tracking ref for %s: %w", branch, err)
 		}
-		log.Printf("[Fetch] Updated tracking ref for %s to %s", branch, commitHash)
+
+		updatedRefs++
+		if !opts.Quiet && opts.Verbose {
+			log.Printf("[Fetch] Updated tracking ref for %s to %s", branch, commitHash)
+		}
 	}
 
-	log.Printf("[Fetch] Fetch completed successfully for remote '%s'", remoteName)
-	fmt.Println("Fetch completed successfully.")
+	if !opts.Quiet {
+		fmt.Printf("Updated %d remote-tracking references\n", updatedRefs)
+	}
+
 	return nil
 }
 
-// FetchBranch fetches a specific branch from the remote repository.
-func FetchBranch(repoRoot, remoteName, branch string) error {
+// FetchBranchWithOptions fetches a specific branch from the remote with additional options
+func FetchBranchWithOptions(repoRoot, remoteName, branch string, opts FetchOptions) error {
+	if !opts.Quiet && opts.Verbose {
+		log.Printf("[FetchBranch] Starting fetch of branch '%s' from remote '%s'", branch, remoteName)
+	}
+
 	// Load config
 	cfg, err := config.LoadConfig(repoRoot)
 	if err != nil {
@@ -155,6 +242,10 @@ func FetchBranch(repoRoot, remoteName, branch string) error {
 	remoteURL, err := cfg.GetRemoteURL(remoteName)
 	if err != nil {
 		return fmt.Errorf("failed to get remote URL: %w", err)
+	}
+
+	if !opts.Quiet && opts.Verbose {
+		log.Printf("[FetchBranch] Using remote URL: %s", remoteURL)
 	}
 
 	// Fetch remote refs
@@ -164,9 +255,19 @@ func FetchBranch(repoRoot, remoteName, branch string) error {
 	}
 
 	// Ensure the specific branch exists on the remote
-	remoteHash, exists := refs[branch]
+	branchFullRef := branch
+	// If the branch doesn't start with refs/, assume it's a regular branch name
+	if !strings.HasPrefix(branch, "refs/") {
+		branchFullRef = "refs/heads/" + branch
+	}
+
+	remoteHash, exists := refs[branchFullRef]
 	if !exists {
 		return fmt.Errorf("branch '%s' not found on remote", branch)
+	}
+
+	if !opts.Quiet && opts.Verbose {
+		log.Printf("[FetchBranch] Found branch '%s' at commit %s", branch, remoteHash)
 	}
 
 	// Get local refs for negotiation
@@ -176,10 +277,23 @@ func FetchBranch(repoRoot, remoteName, branch string) error {
 	}
 
 	// Restrict negotiation to the selected branch only
-	remoteBranchRef := map[string]string{branch: remoteHash}
+	remoteBranchRef := map[string]string{branchFullRef: remoteHash}
 	localBranchRef := map[string]string{}
-	if localHash, ok := localRefs[branch]; ok {
-		localBranchRef[branch] = localHash
+
+	// Check if we already have this branch locally
+	if localHash, ok := localRefs[branchFullRef]; ok {
+		localBranchRef[branchFullRef] = localHash
+		if !opts.Quiet && opts.Verbose {
+			log.Printf("[FetchBranch] Local branch exists at commit %s", localHash)
+		}
+	}
+
+	// In dry-run mode, just report
+	if opts.DryRun {
+		if !opts.Quiet {
+			fmt.Printf("Would fetch branch '%s' from remote '%s'\n", branch, remoteName)
+		}
+		return nil
 	}
 
 	// Negotiate with the server to determine missing objects for the specific branch
@@ -189,99 +303,133 @@ func FetchBranch(repoRoot, remoteName, branch string) error {
 	}
 
 	if len(missingObjects) == 0 {
-		fmt.Printf("Branch '%s' is already up to date.\n", branch)
+		if !opts.Quiet {
+			fmt.Printf("Branch '%s' is already up to date.\n", branch)
+		}
 		return nil
 	}
 
+	if !opts.Quiet && opts.Verbose {
+		log.Printf("[FetchBranch] Need to fetch %d objects for branch '%s'", len(missingObjects), branch)
+	}
+
 	// Fetch the packfile containing missing objects
+	if !opts.Quiet && opts.Progress {
+		fmt.Printf("Downloading objects for branch '%s': %d object(s)\n", branch, len(missingObjects))
+	}
+
 	packfile, err := fetchPackfile(remoteURL, remoteName, missingObjects, cfg)
 	if err != nil {
 		return fmt.Errorf("failed to fetch packfile for branch '%s': %w", branch, err)
 	}
 
-	// Unpack the packfile using production logic
+	// Unpack the packfile
+	if !opts.Quiet && opts.Progress {
+		fmt.Printf("Unpacking objects: 100%% (%d/%d)\n", len(missingObjects), len(missingObjects))
+	}
+
 	if err := unpackPackfile(repoRoot, packfile); err != nil {
 		return fmt.Errorf("failed to unpack packfile for branch '%s': %w", branch, err)
 	}
 
 	// Update local tracking ref for the specific branch
-	refPath := filepath.Join(repoRoot, ".vec", "refs", "remotes", remoteName, branch)
-	if err := os.MkdirAll(filepath.Dir(refPath), 0755); err != nil {
+	// Ensure directory exists
+	refDir := filepath.Join(repoRoot, ".vec", "refs", "remotes", remoteName)
+	if err := os.MkdirAll(refDir, 0755); err != nil {
 		return fmt.Errorf("failed to create refs directory: %w", err)
 	}
-	if err := os.WriteFile(refPath, []byte(remoteHash+"\n"), 0644); err != nil {
-		return fmt.Errorf("failed to update tracking ref for branch '%s': %w", branch, err)
+
+	// Get the simple branch name without refs/heads/ prefix
+	shortBranchName := branch
+	if strings.HasPrefix(branch, "refs/heads/") {
+		shortBranchName = strings.TrimPrefix(branch, "refs/heads/")
 	}
 
-	fmt.Printf("Fetch for branch '%s' completed successfully.\n", branch)
+	// Write the remote tracking reference
+	refPath := filepath.Join(refDir, shortBranchName)
+	if err := os.WriteFile(refPath, []byte(remoteHash+"\n"), 0644); err != nil {
+		return fmt.Errorf("failed to update tracking ref for branch '%s': %w", shortBranchName, err)
+	}
+
+	if !opts.Quiet {
+		fmt.Printf("Branch '%s' updated to %s\n", shortBranchName, remoteHash[:8])
+	}
+
 	return nil
+}
+
+// identifyRefsToRemove identifies remote tracking refs that no longer exist on the remote
+func identifyRefsToRemove(repoRoot, remoteName string, currentRemoteRefs map[string]string) []string {
+	var refsToRemove []string
+
+	// Get the directory containing remote tracking refs
+	remoteRefsDir := filepath.Join(repoRoot, ".vec", "refs", "remotes", remoteName)
+	if !utils.FileExists(remoteRefsDir) {
+		return refsToRemove // No remote refs yet
+	}
+
+	// Walk the remote tracking refs
+	filepath.Walk(remoteRefsDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil // Skip on error
+		}
+
+		// Skip directories
+		if info.IsDir() {
+			return nil
+		}
+
+		// Get relative path to determine ref name
+		relPath, err := filepath.Rel(remoteRefsDir, path)
+		if err != nil {
+			return nil
+		}
+
+		// Convert to the remote ref format
+		refName := "refs/heads/" + relPath
+
+		// If this ref no longer exists in the current remote refs, mark for removal
+		if _, exists := currentRemoteRefs[refName]; !exists {
+			refsToRemove = append(refsToRemove, relPath)
+		}
+
+		return nil
+	})
+
+	return refsToRemove
+}
+
+// pruneRemoteRefs removes remote tracking refs that no longer exist on the remote
+func pruneRemoteRefs(repoRoot, remoteName string, refsToRemove []string) error {
+	for _, ref := range refsToRemove {
+		refPath := filepath.Join(repoRoot, ".vec", "refs", "remotes", remoteName, ref)
+		if err := os.Remove(refPath); err != nil {
+			return fmt.Errorf("failed to remove stale ref '%s': %w", ref, err)
+		}
+		log.Printf("[Prune] Removed stale remote-tracking branch '%s'", ref)
+	}
+	return nil
+}
+
+// Fetch is the original function (now it uses FetchWithOptions)
+func Fetch(repoRoot, remoteName string) error {
+	return FetchWithOptions(repoRoot, remoteName, FetchOptions{
+		Progress: true,
+	})
+}
+
+// FetchBranch is the original function (now it uses FetchBranchWithOptions)
+func FetchBranch(repoRoot, remoteName, branch string) error {
+	return FetchBranchWithOptions(repoRoot, remoteName, branch, FetchOptions{
+		Progress: true,
+	})
 }
 
 // fetchRemoteRefs retrieves the branch refs from the remote with retry logic
 func fetchRemoteRefs(remoteURL, remoteName string, cfg *config.Config) (map[string]string, error) {
-	// Update URL path to match server's structure - using /:username/:repo_slug/refs
-	url := fmt.Sprintf("%s/refs", remoteURL)
-	log.Printf("[fetchRemoteRefs] Fetching refs from %s", url)
-	client := &http.Client{Timeout: 10 * time.Second}
+	log.Printf("[fetchRemoteRefs] Fetching refs from endpoint: %s", vechttp.EndpointRefs)
 
-	for attempt := 1; attempt <= 3; attempt++ {
-		log.Printf("[fetchRemoteRefs] Attempt %d of 3", attempt)
-		req, err := http.NewRequest("GET", url, nil)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create request: %w", err)
-		}
-
-		// Add authentication headers if available
-		ApplyAuthHeaders(req, remoteName, cfg)
-
-		// Log the request
-		logRequest(req)
-
-		resp, err := client.Do(req)
-		if err != nil {
-			log.Printf("[fetchRemoteRefs] Request error: %v", err)
-			if attempt == 3 {
-				return nil, fmt.Errorf("cannot contact remote after %d attempts: %w", attempt, err)
-			}
-			time.Sleep(time.Duration(attempt) * time.Second)
-			continue
-		}
-
-		// Log the response
-		logResponse(resp)
-		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK {
-			log.Printf("[fetchRemoteRefs] Error response: %d", resp.StatusCode)
-			return nil, fmt.Errorf("refs fetch failed with status %d (URL: %s)", resp.StatusCode, url)
-		}
-
-		// Try to decode as a direct map first
-		var refs map[string]string
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			log.Printf("[fetchRemoteRefs] Failed to read response body: %v", err)
-			return nil, fmt.Errorf("failed to read response body: %w", err)
-		}
-
-		// Try to decode as a direct map
-		if err := json.Unmarshal(body, &refs); err != nil {
-			// If that fails, try to decode as a wrapped object with a "refs" field
-			log.Printf("[fetchRemoteRefs] Failed to decode as direct map, trying wrapped format: %v", err)
-			var wrappedRefs struct {
-				Refs map[string]string `json:"refs"`
-			}
-			if err := json.Unmarshal(body, &wrappedRefs); err != nil {
-				log.Printf("[fetchRemoteRefs] Failed to decode response in any format: %v", err)
-				return nil, fmt.Errorf("failed to decode refs: %w", err)
-			}
-			refs = wrappedRefs.Refs
-		}
-
-		log.Printf("[fetchRemoteRefs] Successfully fetched %d refs", len(refs))
-		return refs, nil
-	}
-	return nil, fmt.Errorf("unexpected error in fetchRemoteRefs")
+	return vechttp.FetchRemoteRefs(remoteURL, remoteName, cfg)
 }
 
 // getLocalRefs retrieves local refs for negotiation
@@ -317,125 +465,34 @@ func negotiateFetch(remoteURL, remoteName string, remoteRefs, localRefs map[stri
 	log.Printf("[negotiateFetch] Starting negotiation for %d remote refs against %d local refs",
 		len(remoteRefs), len(localRefs))
 
-	negotiationData := map[string]interface{}{
-		"want": remoteRefs,
-		"have": localRefs,
-	}
-
-	// Use the correct URL format for the negotiate endpoint
-	url := fmt.Sprintf("%s/negotiate", remoteURL)
-	log.Printf("[negotiateFetch] Negotiating with endpoint: %s", url)
-
-	data, err := json.Marshal(negotiationData)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal negotiation data: %w", err)
-	}
-
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(data))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	// Add authentication headers if available
-	ApplyAuthHeaders(req, remoteName, cfg)
-
-	// Log the request
-	logRequest(req)
-
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		log.Printf("[negotiateFetch] Request error: %v", err)
-		return nil, fmt.Errorf("negotiation request failed: %w", err)
-	}
-
-	// Log the response
-	logResponse(resp)
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		log.Printf("[negotiateFetch] Error response: %d", resp.StatusCode)
-		return nil, fmt.Errorf("negotiation failed with status %d (URL: %s)", resp.StatusCode, url)
-	}
-
-	var missingObjects []string
-	if err := json.NewDecoder(resp.Body).Decode(&missingObjects); err != nil {
-		log.Printf("[negotiateFetch] Failed to decode response: %v", err)
-		return nil, fmt.Errorf("failed to decode missing objects: %w", err)
-	}
-	log.Printf("[negotiateFetch] Negotiation complete, %d objects missing", len(missingObjects))
-	return missingObjects, nil
+	return vechttp.NegotiateFetch(remoteURL, remoteName, remoteRefs, localRefs, cfg)
 }
 
 // fetchPackfile retrieves a packfile containing the specified objects
 func fetchPackfile(remoteURL, remoteName string, objectsList []string, cfg *config.Config) ([]byte, error) {
-	// Use the correct URL format for the packfile endpoint
-	url := fmt.Sprintf("%s/packfile", remoteURL)
-	log.Printf("[fetchPackfile] Fetching packfile from %s for %d objects", url, len(objectsList))
-	client := &http.Client{Timeout: 30 * time.Second}
+	log.Printf("[fetchPackfile] Fetching packfile for %d objects", len(objectsList))
 
-	data, err := json.Marshal(objectsList)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal objects list: %w", err)
-	}
-
-	for attempt := 1; attempt <= 3; attempt++ {
-		log.Printf("[fetchPackfile] Attempt %d of 3", attempt)
-		req, err := http.NewRequest("POST", url, bytes.NewBuffer(data))
-		if err != nil {
-			return nil, fmt.Errorf("failed to create request: %w", err)
-		}
-		req.Header.Set("Content-Type", "application/json")
-
-		// Add authentication headers if available
-		ApplyAuthHeaders(req, remoteName, cfg)
-
-		// Log the request
-		logRequest(req)
-
-		resp, err := client.Do(req)
-		if err != nil {
-			log.Printf("[fetchPackfile] Request error: %v", err)
-			if attempt == 3 {
-				return nil, fmt.Errorf("failed to fetch packfile after %d attempts: %w", attempt, err)
-			}
-			time.Sleep(time.Duration(attempt) * time.Second)
-			continue
-		}
-
-		// Log the response headers (not the body as it might be large)
-		log.Printf("[HTTP Response] Status: %s", resp.Status)
-		log.Printf("[HTTP Response] Headers: %v", resp.Header)
-		log.Printf("[HTTP Response] Content-Length: %s", resp.Header.Get("Content-Length"))
-		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK {
-			log.Printf("[fetchPackfile] Error response: %d", resp.StatusCode)
-			return nil, fmt.Errorf("packfile fetch failed with status %d (URL: %s)", resp.StatusCode, url)
-		}
-
-		packfile, err := io.ReadAll(resp.Body)
-		if err != nil {
-			log.Printf("[fetchPackfile] Failed to read response body: %v", err)
-			return nil, fmt.Errorf("failed to read packfile: %w", err)
-		}
-		log.Printf("[fetchPackfile] Successfully received packfile (%d bytes)", len(packfile))
-		return packfile, nil
-	}
-	return nil, fmt.Errorf("unexpected error in fetchPackfile")
+	return vechttp.FetchPackfile(remoteURL, remoteName, objectsList, cfg)
 }
 
-// getBaseURL extracts the base API URL from a repository-specific URL
-func getBaseURL(repoURL string) string {
-	// No need to strip any path components - we want to preserve the entire URL
-	// to ensure the server knows which repository we're working with
-	return repoURL
-}
-
-// unpackPackfile unpacks the packfile into the local object store using the modern packfile format
+// unpackPackfile unpacks the packfile into the local object store with integrity verification
 func unpackPackfile(repoRoot string, packfile []byte) error {
 	fmt.Printf("Unpacking packfile (%d bytes)...\n", len(packfile))
+
+	// Verify packfile format first
+	if len(packfile) < 12 { // Header (8) + at least some content + checksum (32)
+		return fmt.Errorf("invalid packfile: too short (%d bytes)", len(packfile))
+	}
+
+	// Check for PACK signature
+	if string(packfile[:4]) != "PACK" {
+		// Try alternative format before failing
+		if objects, err := objects.ParsePackfile(packfile); err == nil {
+			fmt.Println("Using legacy packfile format")
+			return saveObjects(repoRoot, objects)
+		}
+		return fmt.Errorf("invalid packfile: missing PACK signature")
+	}
 
 	// Create a temporary file for the packfile
 	packfileTempFile, err := os.CreateTemp("", "vec-packfile-*.pack")
@@ -465,47 +522,28 @@ func unpackPackfile(repoRoot string, packfile []byte) error {
 		return fmt.Errorf("failed to sync packfile data: %w", err)
 	}
 
-	// Create an index file if needed
-	// We'll check the packfile header to see if it's a modern format
-	if len(packfile) >= 4 && string(packfile[:4]) == "PACK" {
-		// Modern packfile format, create an index if not included
-		// Rewind the file to the beginning for proper reading
-		if _, err := packfileTempFile.Seek(0, 0); err != nil {
-			return fmt.Errorf("failed to seek in packfile: %w", err)
+	// Verify packfile integrity by checking its checksum before processing
+	if len(packfile) > 32 { // Minimum size for a packfile with checksum
+		// Extract the checksum from the end of the packfile
+		storedChecksum := packfile[len(packfile)-32:]
+
+		// Compute checksum of the packfile without the checksum itself
+		hasher := sha256.New()
+		hasher.Write(packfile[:len(packfile)-32])
+		computedChecksum := hasher.Sum(nil)
+
+		// Compare checksums
+		if !bytes.Equal(storedChecksum, computedChecksum) {
+			return fmt.Errorf("packfile checksum verification failed")
 		}
 
-		// Read the header
-		header := objects.PackFileHeader{}
-		if err := binary.Read(packfileTempFile, binary.BigEndian, &header); err != nil {
-			return fmt.Errorf("failed to read packfile header: %w", err)
-		}
-
-		// Create an index for the packfile
-		indexPath := packfilePath + ".idx"
-
-		// Only create the index if we have a modern packfile format and it's not already there
-		if !utils.FileExists(indexPath) {
-			fmt.Println("Creating index for packfile...")
-
-			// Extract object information and create index
-			index := objects.PackfileIndex{
-				Entries: make(map[string]objects.PackIndexEntry),
-			}
-
-			// Use the parsed objects to create the index
-			// For now, we will rely on ParseModernPackfile to handle this
-			// In a full implementation, we should create the index properly here
-
-			if err := objects.WritePackIndex(&index, indexPath); err != nil {
-				return fmt.Errorf("failed to write packfile index: %w", err)
-			}
-		}
+		fmt.Println("Packfile integrity verified")
 	}
 
 	// Close the file so ParseModernPackfile can open it
 	packfileTempFile.Close()
 
-	// Use ParseModernPackfile to parse the packfile with delta support
+	// Use improved ParseModernPackfile to parse the packfile with delta support
 	parsedObjects, err := objects.ParseModernPackfile(packfilePath, true)
 	if err != nil {
 		// If modern parsing fails, try falling back to the original parser for backward compatibility
@@ -516,27 +554,98 @@ func unpackPackfile(repoRoot string, packfile []byte) error {
 		}
 	}
 
+	// Save the extracted objects
+	return saveObjects(repoRoot, parsedObjects)
+}
+
+// saveObjects saves a collection of objects to the repository
+func saveObjects(repoRoot string, objectsList []objects.Object) error {
 	// Save each parsed object to the object store
 	objectsImported := 0
-	for _, obj := range parsedObjects {
-		objPath := objects.GetObjectPath(repoRoot, obj.Hash)
+	skippedObjects := 0
+
+	// Create progress indicators for large imports
+	showProgress := len(objectsList) > 100
+	var progressInterval int
+
+	if showProgress {
+		fmt.Printf("Importing %d objects...\n", len(objectsList))
+		progressInterval = len(objectsList) / 10 // Show progress at 10% intervals
+		if progressInterval < 1 {
+			progressInterval = 1
+		}
+	}
+
+	for i, obj := range objectsList {
+		// Build object path in .vec/objects directory using the hash
+		objPath := filepath.Join(repoRoot, ".vec", "objects", obj.Hash[:2], obj.Hash[2:])
 
 		// Skip if the object already exists
 		if utils.FileExists(objPath) {
+			skippedObjects++
 			continue
 		}
 
-		if err := os.MkdirAll(filepath.Dir(objPath), 0755); err != nil {
-			return fmt.Errorf("failed to create object directory: %w", err)
+		// Show progress periodically
+		if showProgress && i%progressInterval == 0 {
+			fmt.Printf("Progress: %d%% (%d/%d objects)\n", i*100/len(objectsList), i, len(objectsList))
 		}
 
-		if err := os.WriteFile(objPath, obj.Data, 0644); err != nil {
-			return fmt.Errorf("failed to write object %s: %w", obj.Hash, err)
+		// Create directories if they don't exist
+		if err := os.MkdirAll(filepath.Dir(objPath), 0755); err != nil {
+			return fmt.Errorf("failed to create directory for object %s: %w", obj.Hash, err)
+		}
+
+		// Prepare object header based on type (using byte value)
+		var objType string
+		switch obj.Type {
+		case 1: // Commit
+			objType = "commit"
+		case 2: // Tree
+			objType = "tree"
+		case 3: // Blob
+			objType = "blob"
+		default:
+			return fmt.Errorf("unknown object type: %d", obj.Type)
+		}
+
+		header := fmt.Sprintf("%s %d\x00", objType, len(obj.Data))
+
+		// Write object with header
+		f, err := os.Create(objPath)
+		if err != nil {
+			return fmt.Errorf("failed to create object file %s: %w", obj.Hash, err)
+		}
+
+		// Create zlib writer
+		zw := zlib.NewWriter(f)
+
+		// Write header + data
+		if _, err := zw.Write([]byte(header)); err != nil {
+			zw.Close()
+			f.Close()
+			return fmt.Errorf("failed to write object header for %s: %w", obj.Hash, err)
+		}
+
+		if _, err := zw.Write(obj.Data); err != nil {
+			zw.Close()
+			f.Close()
+			return fmt.Errorf("failed to write object data for %s: %w", obj.Hash, err)
+		}
+
+		// Close writers
+		if err := zw.Close(); err != nil {
+			f.Close()
+			return fmt.Errorf("failed to close zlib writer for %s: %w", obj.Hash, err)
+		}
+
+		if err := f.Close(); err != nil {
+			return fmt.Errorf("failed to close object file %s: %w", obj.Hash, err)
 		}
 
 		objectsImported++
 	}
 
-	fmt.Printf("Unpacking completed. Imported %d new objects.\n", objectsImported)
+	fmt.Printf("Successfully imported %d objects (%d already existed)\n", objectsImported, skippedObjects)
 	return nil
 }

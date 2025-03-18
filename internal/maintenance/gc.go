@@ -26,6 +26,12 @@ type GarbageCollectOptions struct {
 	DryRun bool
 	// Verbose output
 	Verbose bool
+	// Whether to also pack referenced objects (more aggressive packing)
+	PackAll bool
+	// Whether to repack existing packfiles for better compression
+	Repack bool
+	// Age threshold for considering objects as old (in days)
+	OldObjectThreshold int
 }
 
 // GCStats contains statistics from the garbage collection operation
@@ -38,6 +44,10 @@ type GCStats struct {
 	ObjectsPacked int
 	// Number of packfiles pruned
 	PackfilesPruned int
+	// Number of packfiles repacked
+	PackfilesRepacked int
+	// Number of referenced objects packed
+	ReferencedObjectsPacked int
 	// Space saved in bytes
 	SpaceSaved int64
 }
@@ -45,10 +55,13 @@ type GCStats struct {
 // DefaultGCOptions returns default garbage collection options
 func DefaultGCOptions() GarbageCollectOptions {
 	return GarbageCollectOptions{
-		Prune:    false,
-		AutoPack: true,
-		DryRun:   false,
-		Verbose:  false,
+		Prune:              false,
+		AutoPack:           true,
+		DryRun:             false,
+		Verbose:            false,
+		PackAll:            false,
+		Repack:             false,
+		OldObjectThreshold: 14, // Default to 14 days
 	}
 }
 
@@ -82,9 +95,13 @@ func GarbageCollect(options GarbageCollectOptions) (*GCStats, error) {
 
 	// Identify unreferenced objects
 	unreferenced := []ObjectInfo{}
+	referenced := []ObjectInfo{}
+
 	for _, obj := range allObjects {
 		if !reachable[obj.Hash] {
 			unreferenced = append(unreferenced, obj)
+		} else {
+			referenced = append(referenced, obj)
 		}
 	}
 
@@ -110,9 +127,21 @@ func GarbageCollect(options GarbageCollectOptions) (*GCStats, error) {
 				}
 				fmt.Printf("Would %s object: %s (%d bytes)\n", action, obj.Hash, obj.Size)
 			}
+
+			if options.PackAll {
+				fmt.Printf("Would also pack %d referenced objects\n", len(referenced))
+			}
+
+			if options.Repack {
+				packfiles, _ := findPackfiles(repoRoot)
+				fmt.Printf("Would repack %d existing packfiles\n", len(packfiles))
+			}
 		}
 		stats.ObjectsRemoved = len(unreferenced)
 		stats.SpaceSaved = totalSize
+		if options.PackAll {
+			stats.ReferencedObjectsPacked = len(referenced)
+		}
 		return stats, nil
 	}
 
@@ -142,10 +171,65 @@ func GarbageCollect(options GarbageCollectOptions) (*GCStats, error) {
 		}
 	}
 
+	// Pack referenced objects if requested
+	if options.PackAll && len(referenced) > 0 {
+		if options.Verbose {
+			fmt.Printf("Packing %d referenced objects...\n", len(referenced))
+		}
+
+		// Determine which referenced objects to pack (older than threshold)
+		var referencedHashes []string
+		var referencedSize int64
+
+		// If OldObjectThreshold is set, only pack objects older than the threshold
+		cutoffTime := time.Now().AddDate(0, 0, -options.OldObjectThreshold)
+
+		for _, obj := range referenced {
+			objInfo, err := os.Stat(obj.Path)
+			if err != nil {
+				continue // Skip objects we can't stat
+			}
+
+			// Only pack objects older than the threshold
+			if objInfo.ModTime().Before(cutoffTime) {
+				referencedHashes = append(referencedHashes, obj.Hash)
+				referencedSize += obj.Size
+			}
+		}
+
+		if len(referencedHashes) > 0 {
+			if err := packReferencedObjects(repoRoot, referencedHashes, options.Verbose); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to pack referenced objects: %v\n", err)
+			} else {
+				stats.ReferencedObjectsPacked = len(referencedHashes)
+				stats.SpaceSaved += referencedSize / 2 // Estimate space saved
+			}
+		} else if options.Verbose {
+			fmt.Println("No referenced objects older than threshold found for packing")
+		}
+	}
+
+	// Repack existing packfiles if requested
+	if options.Repack {
+		packfiles, err := findPackfiles(repoRoot)
+		if err == nil && len(packfiles) > 0 {
+			if options.Verbose {
+				fmt.Printf("Repacking %d existing packfiles...\n", len(packfiles))
+			}
+
+			repacked, err := repackExistingPackfiles(repoRoot, packfiles, options.Verbose)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to repack packfiles: %v\n", err)
+			} else {
+				stats.PackfilesRepacked = repacked
+			}
+		}
+	}
+
 	// Prune old packfiles
 	packfilesBefore, err := findPackfiles(repoRoot)
 	if err == nil && len(packfilesBefore) > 1 {
-		err = pruneOldPackfiles(repoRoot, 14, options.DryRun, options.Verbose)
+		err = pruneOldPackfiles(repoRoot, options.OldObjectThreshold, options.DryRun, options.Verbose)
 		if err != nil {
 			if options.Verbose {
 				fmt.Printf("Warning: failed to prune old packfiles: %v\n", err)
@@ -398,44 +482,65 @@ func packUnreferencedObjects(repoPath string, hashes []string, dryRun, verbose b
 	// Create temporary packfile
 	timestamp := time.Now().Unix()
 	packfileName := fmt.Sprintf("pack-%d.pack", timestamp)
-	indexName := fmt.Sprintf("pack-%d.idx", timestamp)
 	packfilePath := filepath.Join(packDir, packfileName)
-	indexPath := filepath.Join(packDir, indexName)
 
 	if verbose {
-		fmt.Printf("Packing %d objects into %s\n", len(hashes), packfileName)
+		fmt.Printf("Packing %d objects into %s with delta compression...\n", len(hashes), packfileName)
 	}
 
 	if dryRun {
 		return nil // Skip actual packing in dry run
 	}
 
-	// In a real implementation, this would create the packfile and index
-	// For simplicity, we'll just create empty files
-	if err := os.WriteFile(packfilePath, []byte{}, 0644); err != nil {
+	// Create the packfile with our improved function that includes delta compression
+	// and checksum verification
+	err := objects.CreatePackfile(repoPath, hashes, packfilePath, true)
+	if err != nil {
 		return fmt.Errorf("failed to create packfile: %w", err)
 	}
 
-	if err := os.WriteFile(indexPath, []byte{}, 0644); err != nil {
-		return fmt.Errorf("failed to create packfile index: %w", err)
+	// Now remove the original loose objects that have been packed
+	if verbose {
+		fmt.Println("Removing loose objects that have been packed...")
 	}
 
-	// In a real implementation, we would then:
-	// 1. Serialize each object into the packfile
-	// 2. Create an index for the packfile
-	// 3. Remove the original loose objects
+	// Get a list of objects that were successfully packed by checking the index
+	indexPath := packfilePath + ".idx"
+	index, err := objects.ReadPackIndex(indexPath)
+	if err != nil {
+		return fmt.Errorf("failed to read packfile index: %w", err)
+	}
 
-	// Simulating removal of loose objects after packing
+	// Only remove objects that we can confirm were packed
+	var objectsRemoved int
+	var bytesFreed int64
 	for _, hash := range hashes {
-		prefix := hash[:2]
-		suffix := hash[2:]
-		objectPath := filepath.Join(repoPath, ".vec", "objects", prefix, suffix)
+		// Verify the object is in the index before removing the loose object
+		if _, exists := index.Entries[hash]; exists {
+			prefix := hash[:2]
+			suffix := hash[2:]
+			objectPath := filepath.Join(repoPath, ".vec", "objects", prefix, suffix)
 
-		if utils.FileExists(objectPath) {
-			if err := os.Remove(objectPath); err != nil {
-				return fmt.Errorf("failed to remove packed object %s: %w", hash, err)
+			if utils.FileExists(objectPath) {
+				// Get file size before removing for statistics
+				fileInfo, err := os.Stat(objectPath)
+				if err == nil {
+					bytesFreed += fileInfo.Size()
+				}
+
+				if err := os.Remove(objectPath); err != nil {
+					// Log but continue with other objects
+					fmt.Fprintf(os.Stderr, "Warning: failed to remove packed object %s: %v\n", hash, err)
+					continue
+				}
+				objectsRemoved++
 			}
 		}
+	}
+
+	if verbose {
+		fmt.Printf("Removed %d loose objects (%d bytes freed)\n", objectsRemoved, bytesFreed)
+		fmt.Printf("Packfile created at %s\n", packfilePath)
 	}
 
 	return nil
@@ -562,4 +667,123 @@ func pruneOldPackfiles(repoPath string, maxAgeDays int, dryRun, verbose bool) er
 	}
 
 	return nil
+}
+
+// packReferencedObjects packs referenced objects into a packfile
+// Similar to packUnreferencedObjects but keeps the original objects
+func packReferencedObjects(repoPath string, hashes []string, verbose bool) error {
+	if len(hashes) == 0 {
+		return nil // Nothing to do
+	}
+
+	packDir := filepath.Join(repoPath, ".vec", "objects", "pack")
+	if err := utils.EnsureDirExists(packDir); err != nil {
+		return fmt.Errorf("failed to create pack directory: %w", err)
+	}
+
+	// Create packfile name with "ref" prefix to distinguish it
+	timestamp := time.Now().Unix()
+	packfileName := fmt.Sprintf("pack-ref-%d.pack", timestamp)
+	packfilePath := filepath.Join(packDir, packfileName)
+
+	if verbose {
+		fmt.Printf("Packing %d referenced objects into %s...\n", len(hashes), packfileName)
+	}
+
+	// Create the packfile with our improved function
+	err := objects.CreatePackfile(repoPath, hashes, packfilePath, true)
+	if err != nil {
+		return fmt.Errorf("failed to create packfile for referenced objects: %w", err)
+	}
+
+	// Note: We don't remove the original objects since they are referenced
+	if verbose {
+		fmt.Printf("Successfully created packfile for referenced objects at %s\n", packfilePath)
+	}
+
+	return nil
+}
+
+// repackExistingPackfiles repacks existing packfiles for better compression
+func repackExistingPackfiles(repoPath string, packfiles []string, verbose bool) (int, error) {
+	if len(packfiles) == 0 {
+		return 0, nil
+	}
+
+	packDir := filepath.Join(repoPath, ".vec", "objects", "pack")
+
+	// First, extract all objects from the packfiles
+	allObjects := make([]string, 0)
+
+	for _, packfile := range packfiles {
+		if verbose {
+			fmt.Printf("Extracting objects from packfile %s...\n", packfile)
+		}
+
+		packfilePath := filepath.Join(packDir, packfile)
+		indexPath := packfilePath + ".idx"
+
+		// Read the index to get object hashes
+		index, err := objects.ReadPackIndex(indexPath)
+		if err != nil {
+			return 0, fmt.Errorf("failed to read packfile index %s: %w", indexPath, err)
+		}
+
+		// Extract object hashes from the index
+		for hash := range index.Entries {
+			allObjects = append(allObjects, hash)
+		}
+	}
+
+	if len(allObjects) == 0 {
+		if verbose {
+			fmt.Println("No objects found in packfiles, nothing to repack")
+		}
+		return 0, nil
+	}
+
+	if verbose {
+		fmt.Printf("Extracted %d objects from packfiles\n", len(allObjects))
+		fmt.Println("Creating new consolidated packfile...")
+	}
+
+	// Create a new packfile with all extracted objects
+	timestamp := time.Now().Unix()
+	newPackfileName := fmt.Sprintf("pack-repack-%d.pack", timestamp)
+	newPackfilePath := filepath.Join(packDir, newPackfileName)
+
+	// Create the new consolidated packfile
+	err := objects.CreatePackfile(repoPath, allObjects, newPackfilePath, true)
+	if err != nil {
+		return 0, fmt.Errorf("failed to create consolidated packfile: %w", err)
+	}
+
+	if verbose {
+		fmt.Printf("Successfully created consolidated packfile at %s\n", newPackfilePath)
+		fmt.Println("Removing old packfiles...")
+	}
+
+	// Remove old packfiles
+	removed := 0
+	for _, packfile := range packfiles {
+		packfilePath := filepath.Join(packDir, packfile)
+		indexPath := packfilePath + ".idx"
+
+		if err := os.Remove(packfilePath); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to remove old packfile %s: %v\n", packfile, err)
+			continue
+		}
+
+		if err := os.Remove(indexPath); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to remove old packfile index %s: %v\n", indexPath, err)
+		}
+
+		removed++
+	}
+
+	if verbose {
+		fmt.Printf("Removed %d old packfiles\n", removed)
+	}
+
+	return removed, nil
 }

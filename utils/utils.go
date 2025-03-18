@@ -474,3 +474,66 @@ func UnsetConfigValue(repoRoot string, key string, global bool) error {
 	}
 	return WriteConfig(configPath, config)
 }
+
+// GetAllBranches returns a list of all branches in the repository
+func GetAllBranches(repoRoot string) ([]string, error) {
+	branchesDir := filepath.Join(repoRoot, VecDirName, "refs", "heads")
+	if !FileExists(branchesDir) {
+		return nil, fmt.Errorf("branches directory not found")
+	}
+
+	var branches []string
+	err := filepath.Walk(branchesDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		// Skip directories, we only want the branch files
+		if !info.IsDir() {
+			// Get the branch name from the path
+			relativePath, err := filepath.Rel(branchesDir, path)
+			if err != nil {
+				return err
+			}
+			branches = append(branches, relativePath)
+		}
+		return nil
+	})
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to list branches: %w", err)
+	}
+
+	return branches, nil
+}
+
+// SetBranchUpstream sets the upstream branch for a local branch
+func SetBranchUpstream(repoRoot, branchName, remoteName string) error {
+	// Ensure the branch exists
+	branchPath := filepath.Join(repoRoot, VecDirName, "refs", "heads", branchName)
+	if !FileExists(branchPath) {
+		return fmt.Errorf("branch '%s' does not exist", branchName)
+	}
+
+	// Ensure the remote exists in the config
+	cfg, err := ReadConfig(filepath.Join(repoRoot, VecDirName, "config"))
+	if err != nil {
+		return fmt.Errorf("failed to read config: %w", err)
+	}
+
+	// Check if remote exists
+	remoteUrlKey := fmt.Sprintf("remote.%s.url", remoteName)
+	if _, exists := cfg[remoteUrlKey]; !exists {
+		return fmt.Errorf("remote '%s' does not exist", remoteName)
+	}
+
+	// Set upstream configuration
+	branchKey := fmt.Sprintf("branch.%s.remote", branchName)
+	mergeKey := fmt.Sprintf("branch.%s.merge", branchName)
+
+	cfg[branchKey] = remoteName
+	cfg[mergeKey] = fmt.Sprintf("refs/heads/%s", branchName)
+
+	// Write the updated config
+	configPath := filepath.Join(repoRoot, VecDirName, "config")
+	return WriteConfig(configPath, cfg)
+}

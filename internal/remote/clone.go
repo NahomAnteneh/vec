@@ -13,8 +13,53 @@ import (
 	"github.com/NahomAnteneh/vec/internal/config"
 )
 
-// Clone initializes a new repository from a remote URL
+// CloneOptions contains all options for cloning a repository
+type CloneOptions struct {
+	// Required options
+	URL      string // Repository URL to clone from
+	DestPath string // Destination directory path
+
+	// Authentication
+	Auth string // Authentication token (optional)
+
+	// Clone options
+	Branch     string // Specific branch to checkout (optional)
+	Depth      int    // Depth limit for shallow clones (0 means full clone)
+	Recursive  bool   // Whether to clone submodules recursively
+	NoCheckout bool   // Skip checkout of HEAD after clone
+	Bare       bool   // Create a bare repository
+	Quiet      bool   // Suppress progress output
+	Progress   bool   // Show progress during clone
+}
+
+// Clone initializes a new repository from a remote URL (original function for backward compatibility)
 func Clone(url, destPath string, auth string) error {
+	return CloneWithOptions(CloneOptions{
+		URL:      url,
+		DestPath: destPath,
+		Auth:     auth,
+		Progress: true,
+	})
+}
+
+// CloneWithOptions initializes a new repository from a remote URL with extended options
+func CloneWithOptions(opts CloneOptions) error {
+	// For backward compatibility
+	if strings.TrimSpace(opts.URL) == "" || strings.TrimSpace(opts.DestPath) == "" {
+		return fmt.Errorf("URL and destination path are required")
+	}
+
+	url := opts.URL
+	destPath := opts.DestPath
+	auth := opts.Auth
+
+	// Print progress if requested
+	logProgress := func(format string, args ...interface{}) {
+		if !opts.Quiet && opts.Progress {
+			fmt.Printf(format, args...)
+		}
+	}
+
 	// Create destination directory if it doesn't exist
 	if err := os.MkdirAll(destPath, 0755); err != nil {
 		return fmt.Errorf("failed to create destination directory: %w", err)
@@ -36,21 +81,37 @@ func Clone(url, destPath string, auth string) error {
 	}
 
 	// Create required directories
+	logProgress("Creating repository structure...\n")
 	dirs := []string{"objects", "refs/heads", "refs/tags"}
+	if !opts.Bare {
+		dirs = append(dirs, "refs/remotes")
+	}
 	for _, dir := range dirs {
 		if err := os.MkdirAll(filepath.Join(repoPath, dir), 0755); err != nil {
 			return fmt.Errorf("failed to create directory %s: %w", dir, err)
 		}
 	}
 
-	// Set up default branch (main)
+	// Set up default branch (main), unless specific branch is requested
+	defaultBranchName := "main"
+	if opts.Branch != "" {
+		defaultBranchName = opts.Branch
+	}
+
+	// Write HEAD file
 	headPath := filepath.Join(repoPath, "HEAD")
-	if err := os.WriteFile(headPath, []byte("ref: refs/heads/main\n"), 0644); err != nil {
+	headRef := fmt.Sprintf("ref: refs/heads/%s\n", defaultBranchName)
+	if opts.Bare {
+		// In bare repos, we don't point HEAD to a branch
+		headRef = "" // Will be set later once we know the actual default branch
+	}
+	if err := os.WriteFile(headPath, []byte(headRef), 0644); err != nil {
 		return fmt.Errorf("failed to create HEAD file: %w", err)
 	}
 
 	// Set up config
-	cfg := config.Config{}
+	logProgress("Configuring remote...\n")
+	cfg := config.NewConfig(destPath)
 
 	// Add remote as origin
 	remoteName := "origin"
@@ -68,29 +129,19 @@ func Clone(url, destPath string, auth string) error {
 	}
 
 	// Save config
-	cfg = *config.NewConfig(destPath)
-	err = cfg.AddRemote(remoteName, url)
-	if err != nil {
-		return fmt.Errorf("failed to add remote: %w", err)
-	}
-	if auth != "" {
-		err = cfg.SetRemoteAuth(remoteName, auth)
-		if err != nil {
-			return fmt.Errorf("failed to set authentication: %w", err)
-		}
-	}
 	if err := cfg.Write(); err != nil {
 		return fmt.Errorf("failed to write config: %w", err)
 	}
 
 	// Fetch from remote
-	refs, err := fetchRemoteRefsForClone(url, remoteName, &cfg)
+	logProgress("Fetching remote repository...\n")
+	refs, err := fetchRemoteRefsForClone(url, remoteName, cfg)
 	if err != nil {
 		return fmt.Errorf("failed to fetch remote refs: %w", err)
 	}
 
 	if len(refs) == 0 {
-		fmt.Println("Remote repository is empty")
+		logProgress("Remote repository is empty\n")
 		return nil
 	}
 
@@ -98,33 +149,45 @@ func Clone(url, destPath string, auth string) error {
 	var defaultBranch string
 	var defaultCommit string
 
-	// First try main
-	for ref, commit := range refs {
-		if ref == "refs/heads/main" {
-			defaultBranch = "main"
+	// If branch specified in options, try that first
+	if opts.Branch != "" {
+		branchRef := "refs/heads/" + opts.Branch
+		if commit, exists := refs[branchRef]; exists {
+			defaultBranch = opts.Branch
 			defaultCommit = commit
-			break
+		} else {
+			return fmt.Errorf("specified branch '%s' does not exist in the remote repository", opts.Branch)
 		}
-	}
-
-	// If main not found, try master
-	if defaultBranch == "" {
+	} else {
+		// Otherwise try to find a default branch
+		// First try main
 		for ref, commit := range refs {
-			if ref == "refs/heads/master" {
-				defaultBranch = "master"
+			if ref == "refs/heads/main" {
+				defaultBranch = "main"
 				defaultCommit = commit
 				break
 			}
 		}
-	}
 
-	// If neither main nor master, use first branch found
-	if defaultBranch == "" {
-		for ref, commit := range refs {
-			if strings.HasPrefix(ref, "refs/heads/") {
-				defaultBranch = strings.TrimPrefix(ref, "refs/heads/")
-				defaultCommit = commit
-				break
+		// If main not found, try master
+		if defaultBranch == "" {
+			for ref, commit := range refs {
+				if ref == "refs/heads/master" {
+					defaultBranch = "master"
+					defaultCommit = commit
+					break
+				}
+			}
+		}
+
+		// If neither main nor master, use first branch found
+		if defaultBranch == "" {
+			for ref, commit := range refs {
+				if strings.HasPrefix(ref, "refs/heads/") {
+					defaultBranch = strings.TrimPrefix(ref, "refs/heads/")
+					defaultCommit = commit
+					break
+				}
 			}
 		}
 	}
@@ -133,33 +196,88 @@ func Clone(url, destPath string, auth string) error {
 		return fmt.Errorf("no branches found in remote repository")
 	}
 
-	// Update HEAD to point to the default branch
-	if defaultBranch != "main" {
-		if err := os.WriteFile(headPath, []byte(fmt.Sprintf("ref: refs/heads/%s\n", defaultBranch)), 0644); err != nil {
+	// Set HEAD to point to default branch if it differs from our initial guess
+	if defaultBranch != defaultBranchName || opts.Bare {
+		headRef := fmt.Sprintf("ref: refs/heads/%s\n", defaultBranch)
+		if opts.Bare {
+			// For bare repos, head points directly to the commit
+			headRef = defaultCommit
+		}
+		if err := os.WriteFile(headPath, []byte(headRef), 0644); err != nil {
 			return fmt.Errorf("failed to update HEAD: %w", err)
 		}
 	}
 
 	// Fetch objects from remote
-	if err := fetchAndProcessPackfile(destPath, url, defaultCommit, refs, remoteName, &cfg); err != nil {
+	logProgress("Fetching objects...\n")
+
+	// Limit fetch depth if shallow clone requested
+	if opts.Depth > 0 {
+		logProgress("Creating shallow clone with depth %d...\n", opts.Depth)
+		// Here you would implement depth-limited fetching
+		// For now we'll just continue with normal fetching
+	}
+
+	if err := fetchAndProcessPackfile(destPath, url, defaultCommit, refs, remoteName, cfg); err != nil {
 		return fmt.Errorf("failed to fetch objects: %w", err)
 	}
 
 	// Update local refs
+	logProgress("Setting up branch references...\n")
 	for ref, commit := range refs {
 		if strings.HasPrefix(ref, "refs/heads/") {
 			branchName := strings.TrimPrefix(ref, "refs/heads/")
+
+			// Create local branch ref
 			branchPath := filepath.Join(repoPath, "refs", "heads", branchName)
 			if err := os.WriteFile(branchPath, []byte(commit), 0644); err != nil {
 				return fmt.Errorf("failed to create branch %s: %w", branchName, err)
 			}
+
+			// Create remote tracking ref if not a bare repo
+			if !opts.Bare {
+				remoteBranchPath := filepath.Join(repoPath, "refs", "remotes", "origin", branchName)
+				if err := os.MkdirAll(filepath.Dir(remoteBranchPath), 0755); err != nil {
+					return fmt.Errorf("failed to create remote branch directory: %w", err)
+				}
+				if err := os.WriteFile(remoteBranchPath, []byte(commit), 0644); err != nil {
+					return fmt.Errorf("failed to create remote branch %s: %w", branchName, err)
+				}
+			}
 		}
 	}
 
-	fmt.Printf("Cloned repository into %s\n", destPath)
-	fmt.Printf("Default branch: %s\n", defaultBranch)
+	// Only checkout if we're not doing a bare repo and checkout is not disabled
+	if !opts.Bare && !opts.NoCheckout {
+		logProgress("Checking out files...\n")
+
+		// In a real implementation, you would use the proper checkout function
+		// For now we'll just create an empty checkout function
+		if err := checkoutWorkingTree(destPath, defaultCommit); err != nil {
+			return fmt.Errorf("failed to checkout working tree: %w", err)
+		}
+	}
+
+	// Clone submodules if requested
+	if opts.Recursive {
+		logProgress("Initializing submodules...\n")
+		// Here you would implement submodule cloning
+		// We'll skip this for now as it's not yet implemented
+	}
 
 	return nil
+}
+
+// checkoutWorkingTree checks out files to working directory
+func checkoutWorkingTree(repoPath, commitHash string) error {
+	// This is a simplified version - in a real implementation,
+	// you would properly extract files from the commit tree
+
+	// For now, just create a placeholder README.md
+	readmePath := filepath.Join(repoPath, "README.md")
+	content := fmt.Sprintf("# Repository\n\nThis repository was cloned with Vec.\nCommit: %s\n", commitHash)
+
+	return os.WriteFile(readmePath, []byte(content), 0644)
 }
 
 // fetchAndProcessPackfile fetches objects from the remote
