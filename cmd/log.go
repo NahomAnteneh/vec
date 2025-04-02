@@ -5,35 +5,22 @@ import (
 	"strings"
 	"time"
 
+	"github.com/NahomAnteneh/vec/core"
 	"github.com/NahomAnteneh/vec/internal/objects"
-	"github.com/NahomAnteneh/vec/utils"
-	"github.com/spf13/cobra"
 )
 
-var logCmd = &cobra.Command{
-	Use:   "log",
-	Short: "Show commit logs",
-	Args:  cobra.NoArgs,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		repoRoot, err := utils.GetVecRoot()
-		if err != nil {
-			return err
-		}
-		return log(repoRoot)
-	},
-}
-
-func log(repoRoot string) error {
-	currentCommit, err := utils.GetHeadCommit(repoRoot)
+// LogHandler handles the 'log' command for showing commit history
+func LogHandler(repo *core.Repository, args []string) error {
+	currentCommit, err := repo.ReadHead()
 	if err != nil {
-		return err
+		return core.RefError("failed to get current commit", err)
 	}
 
 	// Iterate through the commit history.
 	for currentCommit != "" {
-		commit, err := objects.GetCommit(repoRoot, currentCommit)
+		commit, err := objects.GetCommit(repo.Root, currentCommit)
 		if err != nil {
-			return err
+			return core.ObjectError(fmt.Sprintf("failed to get commit %s", currentCommit), err)
 		}
 
 		fmt.Printf("commit:  %s\n", currentCommit)
@@ -45,15 +32,22 @@ func log(repoRoot string) error {
 		fmt.Println()
 		fmt.Printf("    %s\n", commit.Message) // Indent the message
 		fmt.Println()
+
 		currentCommit = ""
 		if len(commit.Parents) > 0 {
 			currentCommit = commit.Parents[0] // Simple linear history for now.
 		}
-
 	}
 
 	return nil
 }
+
 func init() {
+	logCmd := NewRepoCommand(
+		"log",
+		"Show commit logs",
+		LogHandler,
+	)
+
 	rootCmd.AddCommand(logCmd)
 }

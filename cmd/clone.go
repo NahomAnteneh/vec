@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/NahomAnteneh/vec/core"
 	"github.com/NahomAnteneh/vec/internal/remote"
 	"github.com/NahomAnteneh/vec/utils"
 	"github.com/spf13/cobra"
@@ -21,6 +22,8 @@ var (
 	cloneProgress   bool
 	cloneBareBool   bool
 )
+
+// Note: Clone doesn't use the Repository context pattern because it creates a new repository
 
 // cloneCmd represents the clone command
 var cloneCmd = &cobra.Command{
@@ -65,7 +68,7 @@ Examples:
 			// Extract repository name from URL
 			destPath = extractRepoName(url)
 			if destPath == "" || destPath == "." || destPath == "/" {
-				return fmt.Errorf("unable to determine repository name from URL. Please specify a destination directory")
+				return core.RemoteError("unable to determine repository name from URL. Please specify a destination directory", nil)
 			}
 		}
 
@@ -73,10 +76,10 @@ Examples:
 		if utils.FileExists(destPath) {
 			entries, err := os.ReadDir(destPath)
 			if err != nil {
-				return fmt.Errorf("failed to read destination directory: %w", err)
+				return core.FSError(fmt.Sprintf("failed to read destination directory: %s", destPath), err)
 			}
 			if len(entries) > 0 {
-				return fmt.Errorf("destination path '%s' already exists and is not an empty directory", destPath)
+				return core.FSError(fmt.Sprintf("destination path '%s' already exists and is not an empty directory", destPath), nil)
 			}
 		}
 
@@ -85,7 +88,7 @@ Examples:
 
 		// Validate depth parameter
 		if cloneDepth < 0 {
-			return fmt.Errorf("invalid depth value: %d (must be >= 0)", cloneDepth)
+			return core.RemoteError(fmt.Sprintf("invalid depth value: %d (must be >= 0)", cloneDepth), nil)
 		}
 
 		// Show initial message
@@ -109,7 +112,7 @@ Examples:
 			Quiet:      cloneQuiet,
 			Progress:   cloneProgress,
 		}); err != nil {
-			return fmt.Errorf("clone failed: %w", err)
+			return core.RemoteError("clone failed", err)
 		}
 
 		// Show completion message with timing

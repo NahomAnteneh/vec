@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/NahomAnteneh/vec/core"
 	"github.com/NahomAnteneh/vec/utils"
 )
 
@@ -34,9 +35,25 @@ func NewConfig(repoRoot string) *Config {
 	}
 }
 
-// Load reads the config file from disk (or returns a new config if none exists).
+// NewConfigRepo creates a new Config instance using Repository context
+func NewConfigRepo(repo *core.Repository) *Config {
+	configPath := filepath.Join(repo.VecDir, "config")
+	return &Config{
+		Remotes:  make(map[string]Remote),
+		Settings: make(map[string]map[string]string),
+		path:     configPath,
+	}
+}
+
+// LoadConfig reads the config file from disk (legacy function)
 func LoadConfig(repoRoot string) (*Config, error) {
-	cfg := NewConfig(repoRoot)
+	repo := core.NewRepository(repoRoot)
+	return LoadConfigRepo(repo)
+}
+
+// LoadConfigRepo reads the config file from disk using Repository context
+func LoadConfigRepo(repo *core.Repository) (*Config, error) {
+	cfg := NewConfigRepo(repo)
 	if !utils.FileExists(cfg.path) {
 		return cfg, nil
 	}
@@ -103,8 +120,10 @@ func LoadConfig(repoRoot string) (*Config, error) {
 	return cfg, nil
 }
 
-// Write saves the configuration to disk.
+// Write saves the configuration to disk (legacy function).
 func (c *Config) Write() error {
+	// No need for a repository instance in this case, as we already have the path
+	// The path is set during config creation either via NewConfig or NewConfigRepo
 	var buf strings.Builder
 	for section, keys := range c.Settings {
 		buf.WriteString(fmt.Sprintf("[%s]\n", section))

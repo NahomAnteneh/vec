@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/NahomAnteneh/vec/core"
 	"github.com/NahomAnteneh/vec/internal/config"
 	"github.com/NahomAnteneh/vec/internal/merge"
 	vechttp "github.com/NahomAnteneh/vec/internal/remote/http"
@@ -436,16 +437,22 @@ func prune(repoRoot, remoteName string) error {
 	})
 }
 
-// MergeRemoteBranch merges a remote branch into the current local branch
+// MergeRemoteBranch merges a remote branch into the current branch (legacy function)
 func MergeRemoteBranch(repoRoot, remoteName, remoteBranch string, interactive bool) error {
+	repo := core.NewRepository(repoRoot)
+	return MergeRemoteBranchRepo(repo, remoteName, remoteBranch, interactive)
+}
+
+// MergeRemoteBranchRepo merges a remote branch into the current branch using Repository context
+func MergeRemoteBranchRepo(repo *core.Repository, remoteName, remoteBranch string, interactive bool) error {
 	// Validate repository
-	vecDir := filepath.Join(repoRoot, ".vec")
+	vecDir := repo.VecDir
 	if _, err := os.Stat(vecDir); os.IsNotExist(err) {
-		return fmt.Errorf("not a vec repository: %s", repoRoot)
+		return fmt.Errorf("not a vec repository: %s", repo.Root)
 	}
 
 	// Load config to get remote info
-	cfg, err := config.LoadConfig(repoRoot)
+	cfg, err := config.LoadConfig(repo.Root)
 	if err != nil {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
@@ -463,7 +470,7 @@ func MergeRemoteBranch(repoRoot, remoteName, remoteBranch string, interactive bo
 	}
 
 	// Get the current branch
-	currentBranch, err := merge.GetCurrentBranch(repoRoot)
+	currentBranch, err := merge.GetCurrentBranch(repo.Root)
 	if err != nil {
 		return fmt.Errorf("failed to determine current branch: %w", err)
 	}
@@ -489,17 +496,14 @@ func MergeRemoteBranch(repoRoot, remoteName, remoteBranch string, interactive bo
 	// Clean up the temporary branch when we're done
 	defer os.Remove(tempRefPath)
 
-	// Set up merge configuration
+	// Perform the merge
 	mergeConfig := &merge.MergeConfig{
 		Strategy:    merge.MergeStrategyRecursive,
 		Interactive: interactive,
 	}
 
-	// Perform the merge
-	fmt.Printf("Merging remote branch '%s/%s' into local branch '%s'\n",
-		remoteName, remoteBranch, currentBranch)
-
-	hasConflicts, err := merge.Merge(repoRoot, tempBranchName, mergeConfig)
+	fmt.Printf("Merging %s/%s into %s\n", remoteName, remoteBranch, currentBranch)
+	hasConflicts, err := merge.MergeRepo(repo, tempBranchName, mergeConfig)
 	if err != nil {
 		if strings.Contains(err.Error(), "already up-to-date") {
 			fmt.Printf("Branch '%s' is already up-to-date with '%s/%s'\n",

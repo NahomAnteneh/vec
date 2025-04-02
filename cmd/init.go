@@ -5,29 +5,35 @@ import (
 	"fmt"
 	"path/filepath"
 
+	"github.com/NahomAnteneh/vec/core"
 	"github.com/NahomAnteneh/vec/internal/repository"
-	"github.com/spf13/cobra"
 )
 
-var initCmd = &cobra.Command{
-	Use:   "init [directory]",
-	Short: "Initialize a new, empty Vec repository",
-	Args:  cobra.MaximumNArgs(1), // Allow optional directory argument.
-	RunE: func(cmd *cobra.Command, args []string) error {
-		dir := "." // Default to current directory.
-		if len(args) > 0 {
-			dir = args[0]
-		}
+// initHandler handles the initialization of a new repository
+func initHandler(args []string) error {
+	dir := "." // Default to current directory.
+	if len(args) > 0 {
+		dir = args[0]
+	}
 
-		absDir, err := filepath.Abs(dir)
-		if err != nil {
-			return fmt.Errorf("failed to get absolute path: %w", err)
-		}
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		return core.FSError("failed to get absolute path", err)
+	}
 
-		return repository.CreateRepository(absDir)
-	},
+	if err := repository.CreateRepository(absDir); err != nil {
+		return core.RepositoryError(fmt.Sprintf("failed to initialize repository in '%s'", absDir), err)
+	}
+
+	return nil
 }
 
+// init adds the init command to the root command
 func init() {
+	initCmd := NewInitCommand(
+		"init [directory]",
+		"Initialize a new, empty Vec repository",
+		initHandler,
+	)
 	rootCmd.AddCommand(initCmd)
 }

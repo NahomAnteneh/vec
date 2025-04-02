@@ -2,7 +2,6 @@
 package remote
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"fmt"
 	"log"
@@ -14,8 +13,11 @@ import (
 
 	"compress/zlib"
 
+	"sync"
+
+	"github.com/NahomAnteneh/vec/core"
 	"github.com/NahomAnteneh/vec/internal/config"
-	"github.com/NahomAnteneh/vec/internal/objects"
+	"github.com/NahomAnteneh/vec/internal/packfile"
 	vechttp "github.com/NahomAnteneh/vec/internal/remote/http"
 	"github.com/NahomAnteneh/vec/utils"
 )
@@ -71,14 +73,14 @@ func logResponse(resp *http.Response) {
 	log.Printf("[HTTP Response] Status: %s\n%s", resp.Status, respLog)
 }
 
-// FetchWithOptions fetches from a remote with additional options
-func FetchWithOptions(repoRoot, remoteName string, opts FetchOptions) error {
+// FetchWithOptionsRepo fetches from a remote with additional options using Repository context
+func FetchWithOptionsRepo(repo *core.Repository, remoteName string, opts FetchOptions) error {
 	if !opts.Quiet && opts.Verbose {
 		log.Printf("[Fetch] Starting fetch from remote '%s' with options: %+v", remoteName, opts)
 	}
 
 	// Load config
-	cfg, err := config.LoadConfig(repoRoot)
+	cfg, err := config.LoadConfigRepo(repo)
 	if err != nil {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
@@ -106,11 +108,11 @@ func FetchWithOptions(repoRoot, remoteName string, opts FetchOptions) error {
 	// Handle specific branch filter if provided in options
 	if opts.Branch != "" {
 		// Use the specific branch fetch function
-		return FetchBranchWithOptions(repoRoot, remoteName, opts.Branch, opts)
+		return FetchBranchWithOptionsRepo(repo, remoteName, opts.Branch, opts)
 	}
 
 	// Get local refs for negotiation
-	localRefs, err := getLocalRefs(repoRoot)
+	localRefs, err := getLocalRefsRepo(repo)
 	if err != nil {
 		return fmt.Errorf("failed to get local refs: %w", err)
 	}
@@ -122,14 +124,14 @@ func FetchWithOptions(repoRoot, remoteName string, opts FetchOptions) error {
 	// Check for prune case - identify remote refs that should be pruned
 	var refsToRemove []string
 	if opts.Prune {
-		refsToRemove = identifyRefsToRemove(repoRoot, remoteName, refs)
+		refsToRemove = identifyRefsToRemoveRepo(repo, remoteName, refs)
 		if !opts.Quiet && opts.Verbose && len(refsToRemove) > 0 {
 			log.Printf("[Fetch] Found %d remote refs to prune", len(refsToRemove))
 		}
 
 		// Perform pruning if not in dry-run mode
 		if !opts.DryRun && len(refsToRemove) > 0 {
-			if err := pruneRemoteRefs(repoRoot, remoteName, refsToRemove); err != nil {
+			if err := pruneRemoteRefsRepo(repo, remoteName, refsToRemove); err != nil {
 				log.Printf("[Fetch] Warning: pruning failed: %v", err)
 				// Continue with fetch even if pruning fails
 			} else if !opts.Quiet {
@@ -192,48 +194,73 @@ func FetchWithOptions(repoRoot, remoteName string, opts FetchOptions) error {
 		fmt.Printf("Unpacking objects: 100%% (%d/%d)\n", len(missingObjects), len(missingObjects))
 	}
 
-	if err := unpackPackfile(repoRoot, packfile); err != nil {
+	if err := unpackPackfileRepo(repo, packfile); err != nil {
 		return fmt.Errorf("failed to unpack packfile: %w", err)
 	}
 
 	// Update local tracking refs
 	updatedRefs := 0
-	for branch, commitHash := range refs {
-		// Skip non-branch refs if only want branches
-		if !opts.FetchTags && !strings.HasPrefix(branch, "refs/heads/") {
+	for refName, hash := range refs {
+		// Skip HEAD ref
+		if refName == "HEAD" {
 			continue
 		}
 
-		refPath := filepath.Join(repoRoot, ".vec", "refs", "remotes", remoteName, branch)
-		if err := os.MkdirAll(filepath.Dir(refPath), 0755); err != nil {
-			return fmt.Errorf("failed to create refs directory: %w", err)
+		// Convert remote ref name to local tracking ref
+		localRef := fmt.Sprintf("refs/remotes/%s/%s", remoteName, strings.TrimPrefix(refName, "refs/heads/"))
+
+		// Get current value of local ref, if it exists
+		oldHash := ""
+		localRefPath := filepath.Join(repo.VecDir, localRef)
+		if utils.FileExists(localRefPath) {
+			content, err := os.ReadFile(localRefPath)
+			if err == nil {
+				oldHash = strings.TrimSpace(string(content))
+			}
 		}
 
-		if err := os.WriteFile(refPath, []byte(commitHash+"\n"), 0644); err != nil {
-			return fmt.Errorf("failed to update tracking ref for %s: %w", branch, err)
+		// Skip update if hash hasn't changed and not forced
+		if oldHash == hash && !opts.Force {
+			continue
+		}
+
+		// Ensure directory exists
+		refDir := filepath.Dir(localRefPath)
+		if err := os.MkdirAll(refDir, 0755); err != nil {
+			return fmt.Errorf("failed to create ref directory: %w", err)
+		}
+
+		// Write new ref
+		if err := os.WriteFile(localRefPath, []byte(hash+"\n"), 0644); err != nil {
+			return fmt.Errorf("failed to update local ref %s: %w", localRef, err)
+		}
+
+		if !opts.Quiet && opts.Verbose {
+			if oldHash == "" {
+				fmt.Printf("* [new branch]      %s -> %s\n", strings.TrimPrefix(refName, "refs/heads/"), strings.TrimPrefix(localRef, "refs/remotes/"))
+			} else {
+				fmt.Printf("* [updated]         %s -> %s\n", strings.TrimPrefix(refName, "refs/heads/"), strings.TrimPrefix(localRef, "refs/remotes/"))
+			}
 		}
 
 		updatedRefs++
-		if !opts.Quiet && opts.Verbose {
-			log.Printf("[Fetch] Updated tracking ref for %s to %s", branch, commitHash)
-		}
 	}
 
-	if !opts.Quiet {
-		fmt.Printf("Updated %d remote-tracking references\n", updatedRefs)
+	if !opts.Quiet && !opts.Verbose {
+		fmt.Printf("Updated %d reference(s)\n", updatedRefs)
 	}
 
 	return nil
 }
 
-// FetchBranchWithOptions fetches a specific branch from the remote with additional options
-func FetchBranchWithOptions(repoRoot, remoteName, branch string, opts FetchOptions) error {
+// FetchBranchWithOptionsRepo fetches a specific branch from a remote using Repository context
+func FetchBranchWithOptionsRepo(repo *core.Repository, remoteName, branch string, opts FetchOptions) error {
 	if !opts.Quiet && opts.Verbose {
-		log.Printf("[FetchBranch] Starting fetch of branch '%s' from remote '%s'", branch, remoteName)
+		log.Printf("[Fetch] Starting fetch of branch '%s' from remote '%s'", branch, remoteName)
 	}
 
 	// Load config
-	cfg, err := config.LoadConfig(repoRoot)
+	cfg, err := config.LoadConfigRepo(repo)
 	if err != nil {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
@@ -244,9 +271,8 @@ func FetchBranchWithOptions(repoRoot, remoteName, branch string, opts FetchOptio
 		return fmt.Errorf("failed to get remote URL: %w", err)
 	}
 
-	if !opts.Quiet && opts.Verbose {
-		log.Printf("[FetchBranch] Using remote URL: %s", remoteURL)
-	}
+	// Prepare the branch reference name
+	branchRef := "refs/heads/" + branch
 
 	// Fetch remote refs
 	refs, err := fetchRemoteRefs(remoteURL, remoteName, cfg)
@@ -254,73 +280,50 @@ func FetchBranchWithOptions(repoRoot, remoteName, branch string, opts FetchOptio
 		return fmt.Errorf("failed to fetch remote refs: %w", err)
 	}
 
-	// Ensure the specific branch exists on the remote
-	branchFullRef := branch
-	// If the branch doesn't start with refs/, assume it's a regular branch name
-	if !strings.HasPrefix(branch, "refs/") {
-		branchFullRef = "refs/heads/" + branch
-	}
-
-	remoteHash, exists := refs[branchFullRef]
-	if !exists {
-		return fmt.Errorf("branch '%s' not found on remote", branch)
-	}
-
-	if !opts.Quiet && opts.Verbose {
-		log.Printf("[FetchBranch] Found branch '%s' at commit %s", branch, remoteHash)
+	// Check if the branch exists on the remote
+	if _, exists := refs[branchRef]; !exists {
+		return fmt.Errorf("branch '%s' not found on remote '%s'", branch, remoteName)
 	}
 
 	// Get local refs for negotiation
-	localRefs, err := getLocalRefs(repoRoot)
+	localRefs, err := getLocalRefsRepo(repo)
 	if err != nil {
 		return fmt.Errorf("failed to get local refs: %w", err)
 	}
 
-	// Restrict negotiation to the selected branch only
-	remoteBranchRef := map[string]string{branchFullRef: remoteHash}
-	localBranchRef := map[string]string{}
+	// Filter remote refs to only include the requested branch
+	filteredRefs := make(map[string]string)
+	filteredRefs[branchRef] = refs[branchRef]
 
-	// Check if we already have this branch locally
-	if localHash, ok := localRefs[branchFullRef]; ok {
-		localBranchRef[branchFullRef] = localHash
-		if !opts.Quiet && opts.Verbose {
-			log.Printf("[FetchBranch] Local branch exists at commit %s", localHash)
-		}
-	}
-
-	// In dry-run mode, just report
-	if opts.DryRun {
-		if !opts.Quiet {
-			fmt.Printf("Would fetch branch '%s' from remote '%s'\n", branch, remoteName)
-		}
-		return nil
-	}
-
-	// Negotiate with the server to determine missing objects for the specific branch
-	missingObjects, err := negotiateFetch(remoteURL, remoteName, remoteBranchRef, localBranchRef, cfg)
+	// Negotiate with the server to determine missing objects
+	missingObjects, err := negotiateFetch(remoteURL, remoteName, filteredRefs, localRefs, cfg)
 	if err != nil {
-		return fmt.Errorf("failed to negotiate fetch for branch '%s': %w", branch, err)
+		return fmt.Errorf("failed to negotiate fetch: %w", err)
 	}
 
 	if len(missingObjects) == 0 {
 		if !opts.Quiet {
-			fmt.Printf("Branch '%s' is already up to date.\n", branch)
+			fmt.Println("Already up to date.")
 		}
 		return nil
 	}
 
-	if !opts.Quiet && opts.Verbose {
-		log.Printf("[FetchBranch] Need to fetch %d objects for branch '%s'", len(missingObjects), branch)
+	// In dry-run mode, just report what would be done
+	if opts.DryRun {
+		if !opts.Quiet {
+			fmt.Printf("Would fetch branch '%s' from remote '%s' (%d objects)\n", branch, remoteName, len(missingObjects))
+		}
+		return nil
 	}
 
 	// Fetch the packfile containing missing objects
 	if !opts.Quiet && opts.Progress {
-		fmt.Printf("Downloading objects for branch '%s': %d object(s)\n", branch, len(missingObjects))
+		fmt.Printf("Downloading objects: %d object(s) for branch '%s'\n", len(missingObjects), branch)
 	}
 
-	packfile, err := fetchPackfile(remoteURL, remoteName, missingObjects, cfg)
+	packfileData, err := fetchPackfile(remoteURL, remoteName, missingObjects, cfg)
 	if err != nil {
-		return fmt.Errorf("failed to fetch packfile for branch '%s': %w", branch, err)
+		return fmt.Errorf("failed to fetch packfile: %w", err)
 	}
 
 	// Unpack the packfile
@@ -328,68 +331,131 @@ func FetchBranchWithOptions(repoRoot, remoteName, branch string, opts FetchOptio
 		fmt.Printf("Unpacking objects: 100%% (%d/%d)\n", len(missingObjects), len(missingObjects))
 	}
 
-	if err := unpackPackfile(repoRoot, packfile); err != nil {
-		return fmt.Errorf("failed to unpack packfile for branch '%s': %w", branch, err)
+	if err := unpackPackfileRepo(repo, packfileData); err != nil {
+		return fmt.Errorf("failed to unpack packfile: %w", err)
 	}
 
-	// Update local tracking ref for the specific branch
+	// Update the local tracking ref for this branch
+	localRef := fmt.Sprintf("refs/remotes/%s/%s", remoteName, branch)
+	localRefPath := filepath.Join(repo.VecDir, localRef)
+
 	// Ensure directory exists
-	refDir := filepath.Join(repoRoot, ".vec", "refs", "remotes", remoteName)
+	refDir := filepath.Dir(localRefPath)
 	if err := os.MkdirAll(refDir, 0755); err != nil {
-		return fmt.Errorf("failed to create refs directory: %w", err)
+		return fmt.Errorf("failed to create ref directory: %w", err)
 	}
 
-	// Get the simple branch name without refs/heads/ prefix
-	shortBranchName := branch
-	if strings.HasPrefix(branch, "refs/heads/") {
-		shortBranchName = strings.TrimPrefix(branch, "refs/heads/")
-	}
-
-	// Write the remote tracking reference
-	refPath := filepath.Join(refDir, shortBranchName)
-	if err := os.WriteFile(refPath, []byte(remoteHash+"\n"), 0644); err != nil {
-		return fmt.Errorf("failed to update tracking ref for branch '%s': %w", shortBranchName, err)
+	// Write new ref
+	if err := os.WriteFile(localRefPath, []byte(refs[branchRef]+"\n"), 0644); err != nil {
+		return fmt.Errorf("failed to update local ref %s: %w", localRef, err)
 	}
 
 	if !opts.Quiet {
-		fmt.Printf("Branch '%s' updated to %s\n", shortBranchName, remoteHash[:8])
+		fmt.Printf("Updated branch '%s' from remote '%s'\n", branch, remoteName)
 	}
 
 	return nil
 }
 
-// identifyRefsToRemove identifies remote tracking refs that no longer exist on the remote
-func identifyRefsToRemove(repoRoot, remoteName string, currentRemoteRefs map[string]string) []string {
-	var refsToRemove []string
+// Legacy functions for backward compatibility
 
-	// Get the directory containing remote tracking refs
-	remoteRefsDir := filepath.Join(repoRoot, ".vec", "refs", "remotes", remoteName)
-	if !utils.FileExists(remoteRefsDir) {
-		return refsToRemove // No remote refs yet
+func FetchWithOptions(repoRoot, remoteName string, opts FetchOptions) error {
+	repo := core.NewRepository(repoRoot)
+	return FetchWithOptionsRepo(repo, remoteName, opts)
+}
+
+func FetchBranchWithOptions(repoRoot, remoteName, branch string, opts FetchOptions) error {
+	repo := core.NewRepository(repoRoot)
+	return FetchBranchWithOptionsRepo(repo, remoteName, branch, opts)
+}
+
+// Helper functions using Repository context
+
+func getLocalRefsRepo(repo *core.Repository) (map[string]string, error) {
+	refs := make(map[string]string)
+
+	// Get all branch refs
+	branchesDir := filepath.Join(repo.VecDir, "refs", "heads")
+	if utils.FileExists(branchesDir) {
+		err := filepath.Walk(branchesDir, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+			if info.IsDir() {
+				return nil
+			}
+			rel, err := filepath.Rel(branchesDir, path)
+			if err != nil {
+				return err
+			}
+			content, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			refs["refs/heads/"+rel] = strings.TrimSpace(string(content))
+			return nil
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to read branch refs: %w", err)
+		}
 	}
 
-	// Walk the remote tracking refs
+	// Get all remote refs
+	remotesDir := filepath.Join(repo.VecDir, "refs", "remotes")
+	if utils.FileExists(remotesDir) {
+		err := filepath.Walk(remotesDir, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+			if info.IsDir() {
+				return nil
+			}
+			rel, err := filepath.Rel(remotesDir, path)
+			if err != nil {
+				return err
+			}
+			content, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			refs["refs/remotes/"+rel] = strings.TrimSpace(string(content))
+			return nil
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to read remote refs: %w", err)
+		}
+	}
+
+	return refs, nil
+}
+
+func identifyRefsToRemoveRepo(repo *core.Repository, remoteName string, currentRemoteRefs map[string]string) []string {
+	var refsToRemove []string
+
+	// Get the local directory for this remote's refs
+	remoteRefsDir := filepath.Join(repo.VecDir, "refs", "remotes", remoteName)
+	if !utils.FileExists(remoteRefsDir) {
+		return refsToRemove
+	}
+
+	// Walk the local refs directory for this remote
 	filepath.Walk(remoteRefsDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			return nil // Skip on error
+			return nil // Skip errors
 		}
-
-		// Skip directories
 		if info.IsDir() {
-			return nil
+			return nil // Skip directories
 		}
 
-		// Get relative path to determine ref name
+		// Get the relative path
 		relPath, err := filepath.Rel(remoteRefsDir, path)
 		if err != nil {
 			return nil
 		}
 
-		// Convert to the remote ref format
-		refName := "refs/heads/" + relPath
-
-		// If this ref no longer exists in the current remote refs, mark for removal
-		if _, exists := currentRemoteRefs[refName]; !exists {
+		// Check if this local remote-tracking ref still exists in the remote
+		remoteRefName := "refs/heads/" + relPath
+		if _, exists := currentRemoteRefs[remoteRefName]; !exists {
 			refsToRemove = append(refsToRemove, relPath)
 		}
 
@@ -399,30 +465,126 @@ func identifyRefsToRemove(repoRoot, remoteName string, currentRemoteRefs map[str
 	return refsToRemove
 }
 
-// pruneRemoteRefs removes remote tracking refs that no longer exist on the remote
-func pruneRemoteRefs(repoRoot, remoteName string, refsToRemove []string) error {
+func pruneRemoteRefsRepo(repo *core.Repository, remoteName string, refsToRemove []string) error {
 	for _, ref := range refsToRemove {
-		refPath := filepath.Join(repoRoot, ".vec", "refs", "remotes", remoteName, ref)
-		if err := os.Remove(refPath); err != nil {
-			return fmt.Errorf("failed to remove stale ref '%s': %w", ref, err)
+		refPath := filepath.Join(repo.VecDir, "refs", "remotes", remoteName, ref)
+		if utils.FileExists(refPath) {
+			if err := os.Remove(refPath); err != nil {
+				return fmt.Errorf("failed to remove ref %s: %w", ref, err)
+			}
 		}
-		log.Printf("[Prune] Removed stale remote-tracking branch '%s'", ref)
 	}
+
 	return nil
 }
 
-// Fetch is the original function (now it uses FetchWithOptions)
-func Fetch(repoRoot, remoteName string) error {
-	return FetchWithOptions(repoRoot, remoteName, FetchOptions{
-		Progress: true,
-	})
+func unpackPackfileRepo(repo *core.Repository, packfileData []byte) error {
+	// Create a temporary file for the packfile
+	tmpFile, err := os.CreateTemp("", "vec-packfile-*.pack")
+	if err != nil {
+		return fmt.Errorf("failed to create temporary packfile: %w", err)
+	}
+	defer os.Remove(tmpFile.Name())
+
+	// Write packfile data to temporary file
+	if _, err := tmpFile.Write(packfileData); err != nil {
+		tmpFile.Close()
+		return fmt.Errorf("failed to write packfile data: %w", err)
+	}
+
+	if err := tmpFile.Close(); err != nil {
+		return fmt.Errorf("failed to close temporary packfile: %w", err)
+	}
+
+	// Extract objects from packfile
+	objects, err := packfile.ParseModernPackfile(tmpFile.Name(), true)
+	if err != nil {
+		// If modern parsing fails, try falling back to the original parser
+		objects, err = packfile.ParsePackfile(packfileData)
+		if err != nil {
+			return fmt.Errorf("failed to parse packfile: %w", err)
+		}
+	}
+
+	// Save extracted objects
+	if err := saveObjectsRepo(repo, objects); err != nil {
+		return fmt.Errorf("failed to save objects: %w", err)
+	}
+
+	return nil
 }
 
-// FetchBranch is the original function (now it uses FetchBranchWithOptions)
-func FetchBranch(repoRoot, remoteName, branch string) error {
-	return FetchBranchWithOptions(repoRoot, remoteName, branch, FetchOptions{
-		Progress: true,
-	})
+func saveObjectsRepo(repo *core.Repository, objectsList []packfile.Object) error {
+	// Create a channel to limit concurrency
+	semaphore := make(chan struct{}, 10)
+	var wg sync.WaitGroup
+
+	// Create a channel for errors
+	errorCh := make(chan error, len(objectsList))
+
+	// Process each object
+	for _, obj := range objectsList {
+		wg.Add(1)
+		semaphore <- struct{}{}
+
+		go func(object packfile.Object) {
+			defer wg.Done()
+			defer func() { <-semaphore }()
+
+			// Calculate hash (using object's data and header)
+			hash := sha256.Sum256(append([]byte(fmt.Sprintf("%s %d\x00", object.Type, len(object.Data))), object.Data...))
+			hashStr := fmt.Sprintf("%x", hash)
+
+			// Prepare object path
+			objDir := filepath.Join(repo.VecDir, "objects", hashStr[:2])
+			objPath := filepath.Join(objDir, hashStr[2:])
+
+			// Skip if object already exists
+			if utils.FileExists(objPath) {
+				return
+			}
+
+			// Create directory if it doesn't exist
+			if err := os.MkdirAll(objDir, 0755); err != nil {
+				errorCh <- fmt.Errorf("failed to create object directory: %w", err)
+				return
+			}
+
+			// Create object file
+			file, err := os.Create(objPath)
+			if err != nil {
+				errorCh <- fmt.Errorf("failed to create object file: %w", err)
+				return
+			}
+			defer file.Close()
+
+			// Compress object data
+			zw := zlib.NewWriter(file)
+			header := []byte(fmt.Sprintf("%s %d\x00", object.Type, len(object.Data)))
+			if _, err := zw.Write(append(header, object.Data...)); err != nil {
+				errorCh <- fmt.Errorf("failed to compress object data: %w", err)
+				return
+			}
+
+			if err := zw.Close(); err != nil {
+				errorCh <- fmt.Errorf("failed to finalize compressed data: %w", err)
+				return
+			}
+		}(obj)
+	}
+
+	// Wait for all goroutines to complete
+	wg.Wait()
+
+	// Check for errors
+	close(errorCh)
+	for err := range errorCh {
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // fetchRemoteRefs retrieves the branch refs from the remote with retry logic
@@ -430,34 +592,6 @@ func fetchRemoteRefs(remoteURL, remoteName string, cfg *config.Config) (map[stri
 	log.Printf("[fetchRemoteRefs] Fetching refs from endpoint: %s", vechttp.EndpointRefs)
 
 	return vechttp.FetchRemoteRefs(remoteURL, remoteName, cfg)
-}
-
-// getLocalRefs retrieves local refs for negotiation
-func getLocalRefs(repoRoot string) (map[string]string, error) {
-	refs := make(map[string]string)
-	refDir := filepath.Join(repoRoot, ".vec", "refs", "heads")
-	if !utils.FileExists(refDir) {
-		return refs, nil // No local refs yet
-	}
-
-	err := filepath.Walk(refDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		if !info.IsDir() {
-			data, err := os.ReadFile(path)
-			if err != nil {
-				return err
-			}
-			relPath, _ := filepath.Rel(refDir, path)
-			refs[relPath] = string(bytes.TrimSpace(data))
-		}
-		return nil
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to walk local refs: %w", err)
-	}
-	return refs, nil
 }
 
 // negotiateFetch determines which objects are missing by negotiating with the server
@@ -473,179 +607,4 @@ func fetchPackfile(remoteURL, remoteName string, objectsList []string, cfg *conf
 	log.Printf("[fetchPackfile] Fetching packfile for %d objects", len(objectsList))
 
 	return vechttp.FetchPackfile(remoteURL, remoteName, objectsList, cfg)
-}
-
-// unpackPackfile unpacks the packfile into the local object store with integrity verification
-func unpackPackfile(repoRoot string, packfile []byte) error {
-	fmt.Printf("Unpacking packfile (%d bytes)...\n", len(packfile))
-
-	// Verify packfile format first
-	if len(packfile) < 12 { // Header (8) + at least some content + checksum (32)
-		return fmt.Errorf("invalid packfile: too short (%d bytes)", len(packfile))
-	}
-
-	// Check for PACK signature
-	if string(packfile[:4]) != "PACK" {
-		// Try alternative format before failing
-		if objects, err := objects.ParsePackfile(packfile); err == nil {
-			fmt.Println("Using legacy packfile format")
-			return saveObjects(repoRoot, objects)
-		}
-		return fmt.Errorf("invalid packfile: missing PACK signature")
-	}
-
-	// Create a temporary file for the packfile
-	packfileTempFile, err := os.CreateTemp("", "vec-packfile-*.pack")
-	if err != nil {
-		return fmt.Errorf("failed to create temporary packfile: %w", err)
-	}
-	packfilePath := packfileTempFile.Name()
-
-	// Make sure we clean up the temporary files when we're done
-	defer func() {
-		packfileTempFile.Close()
-		os.Remove(packfilePath)
-		// Also remove index file if it was created
-		indexPath := packfilePath + ".idx"
-		if utils.FileExists(indexPath) {
-			os.Remove(indexPath)
-		}
-	}()
-
-	// Write the packfile data to the temporary file
-	if _, err := packfileTempFile.Write(packfile); err != nil {
-		return fmt.Errorf("failed to write packfile to temporary file: %w", err)
-	}
-
-	// Flush data to disk
-	if err := packfileTempFile.Sync(); err != nil {
-		return fmt.Errorf("failed to sync packfile data: %w", err)
-	}
-
-	// Verify packfile integrity by checking its checksum before processing
-	if len(packfile) > 32 { // Minimum size for a packfile with checksum
-		// Extract the checksum from the end of the packfile
-		storedChecksum := packfile[len(packfile)-32:]
-
-		// Compute checksum of the packfile without the checksum itself
-		hasher := sha256.New()
-		hasher.Write(packfile[:len(packfile)-32])
-		computedChecksum := hasher.Sum(nil)
-
-		// Compare checksums
-		if !bytes.Equal(storedChecksum, computedChecksum) {
-			return fmt.Errorf("packfile checksum verification failed")
-		}
-
-		fmt.Println("Packfile integrity verified")
-	}
-
-	// Close the file so ParseModernPackfile can open it
-	packfileTempFile.Close()
-
-	// Use improved ParseModernPackfile to parse the packfile with delta support
-	parsedObjects, err := objects.ParseModernPackfile(packfilePath, true)
-	if err != nil {
-		// If modern parsing fails, try falling back to the original parser for backward compatibility
-		fmt.Println("Modern packfile parsing failed, trying legacy format...")
-		parsedObjects, err = objects.ParsePackfile(packfile)
-		if err != nil {
-			return fmt.Errorf("failed to parse packfile: %w", err)
-		}
-	}
-
-	// Save the extracted objects
-	return saveObjects(repoRoot, parsedObjects)
-}
-
-// saveObjects saves a collection of objects to the repository
-func saveObjects(repoRoot string, objectsList []objects.Object) error {
-	// Save each parsed object to the object store
-	objectsImported := 0
-	skippedObjects := 0
-
-	// Create progress indicators for large imports
-	showProgress := len(objectsList) > 100
-	var progressInterval int
-
-	if showProgress {
-		fmt.Printf("Importing %d objects...\n", len(objectsList))
-		progressInterval = len(objectsList) / 10 // Show progress at 10% intervals
-		if progressInterval < 1 {
-			progressInterval = 1
-		}
-	}
-
-	for i, obj := range objectsList {
-		// Build object path in .vec/objects directory using the hash
-		objPath := filepath.Join(repoRoot, ".vec", "objects", obj.Hash[:2], obj.Hash[2:])
-
-		// Skip if the object already exists
-		if utils.FileExists(objPath) {
-			skippedObjects++
-			continue
-		}
-
-		// Show progress periodically
-		if showProgress && i%progressInterval == 0 {
-			fmt.Printf("Progress: %d%% (%d/%d objects)\n", i*100/len(objectsList), i, len(objectsList))
-		}
-
-		// Create directories if they don't exist
-		if err := os.MkdirAll(filepath.Dir(objPath), 0755); err != nil {
-			return fmt.Errorf("failed to create directory for object %s: %w", obj.Hash, err)
-		}
-
-		// Prepare object header based on type (using byte value)
-		var objType string
-		switch obj.Type {
-		case 1: // Commit
-			objType = "commit"
-		case 2: // Tree
-			objType = "tree"
-		case 3: // Blob
-			objType = "blob"
-		default:
-			return fmt.Errorf("unknown object type: %d", obj.Type)
-		}
-
-		header := fmt.Sprintf("%s %d\x00", objType, len(obj.Data))
-
-		// Write object with header
-		f, err := os.Create(objPath)
-		if err != nil {
-			return fmt.Errorf("failed to create object file %s: %w", obj.Hash, err)
-		}
-
-		// Create zlib writer
-		zw := zlib.NewWriter(f)
-
-		// Write header + data
-		if _, err := zw.Write([]byte(header)); err != nil {
-			zw.Close()
-			f.Close()
-			return fmt.Errorf("failed to write object header for %s: %w", obj.Hash, err)
-		}
-
-		if _, err := zw.Write(obj.Data); err != nil {
-			zw.Close()
-			f.Close()
-			return fmt.Errorf("failed to write object data for %s: %w", obj.Hash, err)
-		}
-
-		// Close writers
-		if err := zw.Close(); err != nil {
-			f.Close()
-			return fmt.Errorf("failed to close zlib writer for %s: %w", obj.Hash, err)
-		}
-
-		if err := f.Close(); err != nil {
-			return fmt.Errorf("failed to close object file %s: %w", obj.Hash, err)
-		}
-
-		objectsImported++
-	}
-
-	fmt.Printf("Successfully imported %d objects (%d already existed)\n", objectsImported, skippedObjects)
-	return nil
 }

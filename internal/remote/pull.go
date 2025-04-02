@@ -8,15 +8,23 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/NahomAnteneh/vec/core"
 	"github.com/NahomAnteneh/vec/internal/config"
 	vechttp "github.com/NahomAnteneh/vec/internal/remote/http"
-	"github.com/NahomAnteneh/vec/utils"
 )
 
 // Pull fetches changes from a remote repository and updates the current branch
+// Legacy function that uses the repository root path
 func Pull(repoRoot, remoteName, branchName string, verbose bool) error {
+	// Create a repository context
+	repo := core.NewRepository(repoRoot)
+	return PullRepo(repo, remoteName, branchName, verbose)
+}
+
+// PullRepo fetches changes from a remote repository using the Repository context
+func PullRepo(repo *core.Repository, remoteName, branchName string, verbose bool) error {
 	// Load configuration
-	cfg, err := config.LoadConfig(repoRoot)
+	cfg, err := config.LoadConfig(repo.Root)
 	if err != nil {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
@@ -85,7 +93,7 @@ func Pull(repoRoot, remoteName, branchName string, verbose bool) error {
 	}
 
 	// Get the current commit ID for the branch
-	branchPath := filepath.Join(repoRoot, ".vec", "refs", "heads", branchName)
+	branchPath := filepath.Join(repo.Root, ".vec", "refs", "heads", branchName)
 	localCommitID := ""
 
 	// Check if branch file exists
@@ -104,54 +112,32 @@ func Pull(repoRoot, remoteName, branchName string, verbose bool) error {
 		return nil
 	}
 
-	// Continue with the existing fetch implementation
-	// ...
+	// Fetch objects from remote
+	if err := fetchObjectsForPullRepo(repo, remoteURL, remoteName, localCommitID, remoteCommitID, cfg); err != nil {
+		return fmt.Errorf("failed to fetch objects: %w", err)
+	}
 
+	// Update the branch reference
+	if err := os.MkdirAll(filepath.Dir(branchPath), 0755); err != nil {
+		return fmt.Errorf("failed to create branch directory: %w", err)
+	}
+
+	if err := os.WriteFile(branchPath, []byte(remoteCommitID), 0644); err != nil {
+		return fmt.Errorf("failed to update branch reference: %w", err)
+	}
+
+	log.Printf("Successfully updated branch '%s' to commit %s", branchName, remoteCommitID)
 	return nil
 }
 
-// getCurrentBranchForPull gets the name of the current branch
-func getCurrentBranchForPull(repoRoot string) (string, error) {
-	headFile := filepath.Join(repoRoot, ".vec", "HEAD")
-	if !utils.FileExists(headFile) {
-		return "", fmt.Errorf("HEAD file not found")
-	}
-
-	content, err := os.ReadFile(headFile)
-	if err != nil {
-		return "", fmt.Errorf("failed to read HEAD file: %w", err)
-	}
-
-	headRef := strings.TrimSpace(string(content))
-	if !strings.HasPrefix(headRef, "ref: refs/heads/") {
-		return "", fmt.Errorf("HEAD is detached")
-	}
-
-	return strings.TrimPrefix(headRef, "ref: refs/heads/"), nil
-}
-
-// getLocalBranchCommitForPull gets the commit hash of a local branch
-func getLocalBranchCommitForPull(repoRoot, branchName string) (string, error) {
-	branchFile := filepath.Join(repoRoot, ".vec", "refs", "heads", branchName)
-	if !utils.FileExists(branchFile) {
-		return "", os.ErrNotExist
-	}
-
-	content, err := os.ReadFile(branchFile)
-	if err != nil {
-		return "", err
-	}
-
-	return strings.TrimSpace(string(content)), nil
-}
-
-// getRemoteBranchCommitForPull gets the commit hash of a remote branch
-func getRemoteBranchCommitForPull(remoteURL, remoteName, branchName string, cfg *config.Config) (string, error) {
-	return vechttp.GetBranchCommit(remoteURL, remoteName, branchName, cfg)
-}
-
-// fetchObjectsForPull fetches objects from the remote
+// Legacy function that uses the repository root path
 func fetchObjectsForPull(repoRoot, remoteURL, remoteName, localCommit, remoteCommit string, cfg *config.Config) error {
+	repo := core.NewRepository(repoRoot)
+	return fetchObjectsForPullRepo(repo, remoteURL, remoteName, localCommit, remoteCommit, cfg)
+}
+
+// fetchObjectsForPullRepo fetches objects from the remote using Repository context
+func fetchObjectsForPullRepo(repo *core.Repository, remoteURL, remoteName, localCommit, remoteCommit string, cfg *config.Config) error {
 	// Create a map for negotiation
 	remoteRefs := map[string]string{"want": remoteCommit}
 	localRefs := map[string]string{}
@@ -179,7 +165,7 @@ func fetchObjectsForPull(repoRoot, remoteURL, remoteName, localCommit, remoteCom
 	}
 
 	// Process the packfile to extract objects
-	if err := unpackPackfile(repoRoot, packfile); err != nil {
+	if err := unpackPackfileRepo(repo, packfile); err != nil {
 		return fmt.Errorf("failed to unpack packfile: %w", err)
 	}
 

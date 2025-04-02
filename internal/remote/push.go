@@ -2,6 +2,8 @@
 package remote
 
 import (
+	"bytes"
+	"compress/zlib"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,8 +13,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/NahomAnteneh/vec/core"
 	"github.com/NahomAnteneh/vec/internal/config"
 	"github.com/NahomAnteneh/vec/internal/objects"
+	"github.com/NahomAnteneh/vec/internal/packfile"
 	vechttp "github.com/NahomAnteneh/vec/internal/remote/http"
 	"github.com/NahomAnteneh/vec/utils"
 )
@@ -56,10 +60,17 @@ func Push(repoRoot, remoteName, branchName string, force bool) error {
 	return PushWithOptions(repoRoot, remoteName, branchName, options)
 }
 
-// PushWithOptions sends local commits to a remote repository with the specified options
-func PushWithOptions(repoRoot, remoteName, branchName string, options PushOptions) error {
+// PushRepo sends local commits to a remote repository using Repository context
+func PushRepo(repo *core.Repository, remoteName, branchName string, force bool) error {
+	options := DefaultPushOptions()
+	options.Force = force
+	return PushWithOptionsRepo(repo, remoteName, branchName, options)
+}
+
+// PushWithOptionsRepo sends local commits to a remote repository with the specified options using Repository context
+func PushWithOptionsRepo(repo *core.Repository, remoteName, branchName string, options PushOptions) error {
 	// Load config
-	cfg, err := config.LoadConfig(repoRoot)
+	cfg, err := config.LoadConfigRepo(repo)
 	if err != nil {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
@@ -73,7 +84,7 @@ func PushWithOptions(repoRoot, remoteName, branchName string, options PushOption
 	// Determine local branch
 	if branchName == "" {
 		// Get current branch
-		currentBranch, err := getCurrentBranch(repoRoot)
+		currentBranch, err := repo.GetCurrentBranch()
 		if err != nil {
 			return fmt.Errorf("failed to get current branch: %w", err)
 		}
@@ -85,7 +96,7 @@ func PushWithOptions(repoRoot, remoteName, branchName string, options PushOption
 	}
 
 	// Get local branch commit
-	localCommitHash, err := getLocalBranchCommit(repoRoot, branchName)
+	localCommitHash, err := getLocalBranchCommitRepo(repo, branchName)
 	if err != nil {
 		return fmt.Errorf("failed to get local branch commit: %w", err)
 	}
@@ -106,7 +117,7 @@ func PushWithOptions(repoRoot, remoteName, branchName string, options PushOption
 
 	// If not forcing, verify this is a fast-forward push
 	if !options.Force && remoteCommitHash != "" {
-		isFastForward, err := isFastForwardUpdate(repoRoot, localCommitHash, remoteCommitHash)
+		isFastForward, err := isFastForwardUpdateRepo(repo, localCommitHash, remoteCommitHash)
 		if err != nil {
 			return fmt.Errorf("failed to check if update is fast-forward: %w", err)
 		}
@@ -120,7 +131,7 @@ func PushWithOptions(repoRoot, remoteName, branchName string, options PushOption
 		fmt.Println("Determining objects to send...")
 	}
 
-	objectsToSend, err := getObjectsToSend(repoRoot, localCommitHash, remoteCommitHash)
+	objectsToSend, err := getObjectsToSendRepo(repo, localCommitHash, remoteCommitHash)
 	if err != nil {
 		return fmt.Errorf("failed to determine objects to send: %w", err)
 	}
@@ -148,7 +159,7 @@ func PushWithOptions(repoRoot, remoteName, branchName string, options PushOption
 		fmt.Printf("Creating packfile with %d objects...\n", len(objectsToSend))
 	}
 
-	packfile, err := createPackfile(repoRoot, objectsToSend)
+	packfile, err := createPackfileRepo(repo, objectsToSend)
 	if err != nil {
 		return fmt.Errorf("failed to create packfile: %w", err)
 	}
@@ -191,6 +202,12 @@ func PushWithOptions(repoRoot, remoteName, branchName string, options PushOption
 	return nil
 }
 
+// Legacy function for backward compatibility
+func PushWithOptions(repoRoot, remoteName, branchName string, options PushOptions) error {
+	repo := core.NewRepository(repoRoot)
+	return PushWithOptionsRepo(repo, remoteName, branchName, options)
+}
+
 // formatCommitHash formats a commit hash for display
 func formatCommitHash(hash string) string {
 	if hash == "" {
@@ -222,9 +239,9 @@ func getCurrentBranch(repoRoot string) (string, error) {
 	return strings.TrimPrefix(headRef, "ref: refs/heads/"), nil
 }
 
-// getLocalBranchCommit gets the commit hash of a local branch
-func getLocalBranchCommit(repoRoot, branchName string) (string, error) {
-	branchFile := filepath.Join(repoRoot, ".vec", "refs", "heads", branchName)
+// getLocalBranchCommitRepo gets the commit hash of a local branch using Repository context
+func getLocalBranchCommitRepo(repo *core.Repository, branchName string) (string, error) {
+	branchFile := filepath.Join(repo.VecDir, "refs", "heads", branchName)
 	if !utils.FileExists(branchFile) {
 		return "", fmt.Errorf("branch %s not found", branchName)
 	}
@@ -440,7 +457,7 @@ func createPackfile(repoRoot string, objectHashes []string) ([]byte, error) {
 	createIndex := true
 
 	// Create the packfile using the new format with compression and delta encoding
-	err = objects.CreatePackfile(repoRoot, objectHashes, tempFilePath, createIndex)
+	err = packfile.CreatePackfileFromHashes(repoRoot, objectHashes, tempFilePath, createIndex)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create packfile: %w", err)
 	}
@@ -491,4 +508,199 @@ func performPush(remoteURL, remoteName string, pushData map[string]interface{}, 
 	}
 
 	return convertPushResult(result), nil
+}
+
+// isFastForwardUpdateRepo checks if push is a fast-forward update using Repository context
+func isFastForwardUpdateRepo(repo *core.Repository, localCommitHash, remoteCommitHash string) (bool, error) {
+	// Check if remote commit is an ancestor of local commit
+	isAncestor, err := isCommitAncestorRepo(repo, remoteCommitHash, localCommitHash)
+	if err != nil {
+		return false, fmt.Errorf("failed to check if remote commit is ancestor: %w", err)
+	}
+
+	return isAncestor, nil
+}
+
+// isCommitAncestorRepo checks if one commit is an ancestor of another using Repository context
+func isCommitAncestorRepo(repo *core.Repository, ancestorHash, descendantHash string) (bool, error) {
+	// Follow the commit chain to see if ancestorHash appears
+	visited := make(map[string]bool)
+	queue := []string{descendantHash}
+
+	for len(queue) > 0 {
+		hash := queue[0]
+		queue = queue[1:]
+
+		if hash == ancestorHash {
+			return true, nil
+		}
+
+		if visited[hash] {
+			continue
+		}
+		visited[hash] = true
+
+		commit, err := objects.GetCommitRepo(repo, hash)
+		if err != nil {
+			return false, fmt.Errorf("failed to get commit %s: %w", hash, err)
+		}
+
+		queue = append(queue, commit.Parents...)
+	}
+
+	return false, nil
+}
+
+// getObjectsToSendRepo gets objects that need to be sent to the remote using Repository context
+func getObjectsToSendRepo(repo *core.Repository, localCommitHash, remoteCommitHash string) ([]string, error) {
+	// Get all objects reachable from local commit
+	localObjects, err := findReachableObjectsRepo(repo, localCommitHash)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find local objects: %w", err)
+	}
+
+	// If remote has no commit yet, send all objects
+	if remoteCommitHash == "" {
+		return localObjects, nil
+	}
+
+	// Get all objects reachable from remote commit
+	remoteObjects, err := findReachableObjectsRepo(repo, remoteCommitHash)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find remote objects: %w", err)
+	}
+
+	// Filter out objects already on remote
+	var objectsToSend []string
+	for _, obj := range localObjects {
+		found := false
+		for _, remoteObj := range remoteObjects {
+			if obj == remoteObj {
+				found = true
+				break
+			}
+		}
+		if !found {
+			objectsToSend = append(objectsToSend, obj)
+		}
+	}
+
+	return objectsToSend, nil
+}
+
+// findReachableObjectsRepo finds all objects reachable from a commit using Repository context
+func findReachableObjectsRepo(repo *core.Repository, commitHash string) ([]string, error) {
+	if commitHash == "" {
+		return []string{}, nil
+	}
+
+	objectsMap := make(map[string]bool)
+	visited := make(map[string]bool)
+	queue := []string{commitHash}
+
+	for len(queue) > 0 {
+		hash := queue[0]
+		queue = queue[1:]
+
+		if visited[hash] {
+			continue
+		}
+		visited[hash] = true
+		objectsMap[hash] = true
+
+		// Get object type by reading the object header
+		objPath := filepath.Join(repo.VecDir, "objects", hash[:2], hash[2:])
+		if !utils.FileExists(objPath) {
+			return nil, fmt.Errorf("object %s not found", hash)
+		}
+
+		// Read and decompress the object file
+		file, err := os.Open(objPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to open object file %s: %w", hash, err)
+		}
+		defer file.Close()
+
+		// Create zlib reader
+		zr, err := zlib.NewReader(file)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create zlib reader for %s: %w", hash, err)
+		}
+		defer zr.Close()
+
+		// Read decompressed content
+		content, err := io.ReadAll(zr)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read decompressed content for %s: %w", hash, err)
+		}
+
+		// Parse the object header (format: "type size\0content")
+		nullIndex := bytes.IndexByte(content, 0)
+		if nullIndex == -1 {
+			return nil, fmt.Errorf("invalid object format for %s", hash)
+		}
+
+		header := string(content[:nullIndex])
+		parts := strings.Split(header, " ")
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("invalid object header format for %s", hash)
+		}
+
+		objType := parts[0] // "commit", "tree", or "blob"
+
+		switch objType {
+		case "commit":
+			commit, err := objects.GetCommit(repo.Root, hash)
+			if err != nil {
+				return nil, fmt.Errorf("failed to get commit: %w", err)
+			}
+			objectsMap[commit.Tree] = true
+			queue = append(queue, commit.Tree)
+			queue = append(queue, commit.Parents...)
+
+		case "tree":
+			tree, err := objects.GetTree(repo.Root, hash)
+			if err != nil {
+				return nil, fmt.Errorf("failed to get tree: %w", err)
+			}
+			for _, entry := range tree.Entries {
+				objectsMap[entry.Hash] = true
+				queue = append(queue, entry.Hash)
+			}
+		}
+	}
+
+	// Convert map to slice
+	result := make([]string, 0, len(objectsMap))
+	for obj := range objectsMap {
+		result = append(result, obj)
+	}
+
+	return result, nil
+}
+
+// createPackfileRepo creates a packfile containing the given objects using Repository context
+func createPackfileRepo(repo *core.Repository, objectHashes []string) ([]byte, error) {
+	// Create temporary packfile
+	tempFile, err := os.CreateTemp("", "vec-packfile-*.pack")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temp file: %w", err)
+	}
+	tempPath := tempFile.Name()
+	tempFile.Close()
+	defer os.Remove(tempPath)
+
+	// Create packfile
+	err = packfile.CreatePackfileFromHashesRepo(repo, objectHashes, tempPath, true)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create packfile: %w", err)
+	}
+
+	// Read packfile content
+	content, err := os.ReadFile(tempPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read packfile: %w", err)
+	}
+
+	return content, nil
 }

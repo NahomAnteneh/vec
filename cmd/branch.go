@@ -7,61 +7,60 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/NahomAnteneh/vec/core"
 	"github.com/NahomAnteneh/vec/internal/objects"
-	"github.com/NahomAnteneh/vec/utils"
 	"github.com/spf13/cobra"
 )
 
-var branchCmd = &cobra.Command{
-	Use:   "branch",
-	Short: "List, create, or delete branches",
-	RunE: func(cmd *cobra.Command, args []string) error {
-		repoRoot, err := utils.GetVecRoot()
-		if err != nil {
-			return err
-		}
-		// If no arguments, list branches.
-		if len(args) == 0 {
-			return listBranches(repoRoot, cmd)
-		}
+// BranchHandler handles the branch command functionality
+func BranchHandler(repo *core.Repository, args []string) error {
+	// Retrieve the command through the closure in the factory function
+	cmd := branchCmd
 
-		// If there is flag but no other arguments, return error
-		list, _ := cmd.Flags().GetBool("list")
-		deleteBranch, _ := cmd.Flags().GetString("delete")
-		renameBranch, _ := cmd.Flags().GetString("rename")
-		if list || deleteBranch != "" || renameBranch != "" {
-			return fmt.Errorf("no argument for the defined flag")
-		}
-		// Otherwise, create a branch.
-		return CreateBranch(repoRoot, args[0])
-	},
+	// If no arguments, list branches.
+	if len(args) == 0 {
+		return listBranches(repo, cmd)
+	}
+
+	// If there is flag but no other arguments, return error
+	list, _ := cmd.Flags().GetBool("list")
+	deleteBranch, _ := cmd.Flags().GetString("delete")
+	renameBranch, _ := cmd.Flags().GetString("rename")
+	if list || deleteBranch != "" || renameBranch != "" {
+		return core.RepositoryError("no argument for the defined flag", nil)
+	}
+
+	// Otherwise, create a branch.
+	return CreateBranch(repo, args[0])
 }
 
-func listBranches(repoRoot string, cmd *cobra.Command) error {
+// listBranches lists all branches or performs branch operations based on flags
+func listBranches(repo *core.Repository, cmd *cobra.Command) error {
 	// Get flag values
 	deleteBranch, _ := cmd.Flags().GetString("delete")
 	renameBranch, _ := cmd.Flags().GetString("rename")
 	force, _ := cmd.Flags().GetBool("force")
+
 	if deleteBranch != "" { // Delete branch
-		if err := deleteBranchOp(repoRoot, deleteBranch, force); err != nil {
+		if err := deleteBranchOp(repo, deleteBranch, force); err != nil {
 			return err
 		}
 	} else if renameBranch != "" {
 		args := strings.Split(renameBranch, " ")
 		if len(args) != 2 {
-			return fmt.Errorf("rename requires two arguments")
+			return core.RepositoryError("rename requires two arguments", nil)
 		}
-		if err := renameBranchOp(repoRoot, args[0], args[1]); err != nil {
+		if err := renameBranchOp(repo, args[0], args[1]); err != nil {
 			return err
 		}
 	} else { // List branches (default behavior)
-		branchDir := filepath.Join(repoRoot, ".vec", "refs", "heads")
+		branchDir := filepath.Join(repo.RefsDir, "heads")
 		entries, err := os.ReadDir(branchDir)
 		if err != nil {
-			return fmt.Errorf("failed to read branch directory: %w", err)
+			return core.RefError("failed to read branch directory", err)
 		}
 
-		currentBranch, err := utils.GetCurrentBranch(repoRoot)
+		currentBranch, err := repo.GetCurrentBranch()
 		if err != nil {
 			return err
 		}
@@ -81,160 +80,167 @@ func listBranches(repoRoot string, cmd *cobra.Command) error {
 	return nil
 }
 
-func CreateBranch(repoRoot string, branchName string) error {
+// CreateBranch creates a new branch pointing to the current HEAD commit
+func CreateBranch(repo *core.Repository, branchName string) error {
 	// Basic validation of branch name (you might want more robust checks).
 	if strings.ContainsAny(branchName, " /\\~^:?*[]") {
-		return fmt.Errorf("invalid branch name: %s", branchName)
+		return core.RefError(fmt.Sprintf("invalid branch name: %s", branchName), nil)
 	}
 
-	branchPath := filepath.Join(repoRoot, ".vec", "refs", "heads", branchName)
+	branchPath := filepath.Join(repo.RefsDir, "heads", branchName)
 
 	// Check if branch already exists.
-	if utils.FileExists(branchPath) {
-		return fmt.Errorf("a branch named '%s' already exists", branchName)
+	if core.FileExists(branchPath) {
+		return core.AlreadyExistsError(core.ErrCategoryRef, fmt.Sprintf("branch '%s'", branchName))
 	}
 
 	// Get current commit.
-	currentCommit, err := utils.GetHeadCommit(repoRoot)
+	currentCommit, err := repo.ReadHead()
 	if err != nil {
 		return err
 	}
+
 	if currentCommit == "" {
-		return fmt.Errorf("cannot create branch '%s' at this time", branchName)
+		return core.RepositoryError(fmt.Sprintf("cannot create branch '%s' at this time", branchName), nil)
 	}
 
-	// Create the branch file.
-	if err := os.WriteFile(branchPath, []byte(currentCommit), 0644); err != nil {
-		return fmt.Errorf("failed to create branch: %w", err)
+	// Create the branch file by writing to the reference
+	refPath := filepath.Join("refs", "heads", branchName)
+	if err := repo.WriteRef(refPath, currentCommit); err != nil {
+		return core.RefError("failed to create branch", err)
 	}
+
 	return nil
 }
 
-func deleteBranchOp(repoRoot, branchName string, force bool) error {
-	branchPath := filepath.Join(repoRoot, ".vec", "refs", "heads", branchName)
+// deleteBranchOp deletes a branch, with force option to delete unmerged branches
+func deleteBranchOp(repo *core.Repository, branchName string, force bool) error {
+	branchPath := filepath.Join(repo.RefsDir, "heads", branchName)
 
 	//Check if branch exists
-	if !utils.FileExists(branchPath) {
-		return fmt.Errorf("branch '%s' not found", branchName)
+	if !core.FileExists(branchPath) {
+		return core.NotFoundError(core.ErrCategoryRef, fmt.Sprintf("branch '%s'", branchName))
 	}
 
-	currentBranch, err := utils.GetCurrentBranch(repoRoot)
+	currentBranch, err := repo.GetCurrentBranch()
 	if err != nil {
 		return err
 	}
+
 	// Check if it's the current branch.
 	if branchName == currentBranch {
-		return fmt.Errorf("cannot delete the currently checked-out branch '%s'", branchName)
+		return core.RepositoryError(fmt.Sprintf("cannot delete the currently checked-out branch '%s'", branchName), nil)
 	}
 
 	// Check if the branch is fully merged
 	if !force {
 		// Get the commit hash that the branch points to
-		branchCommitBytes, err := os.ReadFile(branchPath)
+		branchCommitBytes, err := core.ReadFileContent(branchPath)
 		if err != nil {
-			return fmt.Errorf("failed to read branch file: %w", err)
+			return core.RefError("failed to read branch file", err)
 		}
 		branchCommit := strings.TrimSpace(string(branchCommitBytes))
 
 		// Get the commit hash of the current branch
-		currentCommit, err := utils.GetHeadCommit(repoRoot)
+		currentCommit, err := repo.ReadHead()
 		if err != nil {
-			return fmt.Errorf("failed to get current commit: %w", err)
+			return core.RefError("failed to get current commit", err)
 		}
 
 		// Check if the branch commit is an ancestor of the current commit
-		isMerged, err := isAncestor(repoRoot, branchCommit, currentCommit)
+		isMerged, err := isAncestor(repo, branchCommit, currentCommit)
 		if err != nil {
-			return fmt.Errorf("failed to check if branch is merged: %w", err)
+			return core.RepositoryError("failed to check if branch is merged", err)
 		}
 
 		if !isMerged {
-			return fmt.Errorf("branch '%s' is not fully merged. Use --force to delete anyway", branchName)
+			return core.RepositoryError(fmt.Sprintf("branch '%s' is not fully merged. Use --force to delete anyway", branchName), nil)
 		}
 	}
 
 	// Delete the branch file
 	if err := os.Remove(branchPath); err != nil {
-		return fmt.Errorf("failed to delete the branch '%s'", branchName)
+		return core.RefError(fmt.Sprintf("failed to delete the branch '%s'", branchName), err)
 	}
 	return nil
 }
 
-func renameBranchOp(repoRoot, oldName, newName string) error {
+// renameBranchOp renames a branch
+func renameBranchOp(repo *core.Repository, oldName, newName string) error {
 	// Basic validation of branch name (you might want more robust checks).
 	if strings.ContainsAny(newName, " /\\~^:?*[]") {
-		return fmt.Errorf("invalid branch name: %s", newName)
+		return core.RefError(fmt.Sprintf("invalid branch name: %s", newName), nil)
 	}
-	oldBranchPath := filepath.Join(repoRoot, ".vec", "refs", "heads", oldName)
-	newBranchPath := filepath.Join(repoRoot, ".vec", "refs", "heads", newName)
+
+	oldBranchPath := filepath.Join(repo.RefsDir, "heads", oldName)
+	newBranchPath := filepath.Join(repo.RefsDir, "heads", newName)
 
 	// Check if the old branch exists
-	if !utils.FileExists(oldBranchPath) {
-		return fmt.Errorf("branch '%s' not found", oldName)
+	if !core.FileExists(oldBranchPath) {
+		return core.NotFoundError(core.ErrCategoryRef, fmt.Sprintf("branch '%s'", oldName))
 	}
 
 	// Check if branch already exists.
-	if utils.FileExists(newBranchPath) {
-		return fmt.Errorf("a branch named '%s' already exists", newName)
+	if core.FileExists(newBranchPath) {
+		return core.AlreadyExistsError(core.ErrCategoryRef, fmt.Sprintf("branch '%s'", newName))
 	}
 
 	//Rename the branch
 	if err := os.Rename(oldBranchPath, newBranchPath); err != nil {
-		return fmt.Errorf("failed to rename branch '%s' to '%s': %w", oldName, newName, err)
+		return core.RefError(fmt.Sprintf("failed to rename branch '%s' to '%s'", oldName, newName), err)
 	}
 	return nil
 }
 
-// IsAncestor checks if potentialAncestor is an ancestor of potentialDescendant
+// isAncestor checks if potentialAncestor is an ancestor of potentialDescendant
 // Returns true if potentialAncestor is an ancestor of potentialDescendant, false otherwise
-func isAncestor(repoRoot, potentialAncestor, potentialDescendant string) (bool, error) {
+func isAncestor(repo *core.Repository, potentialAncestor, potentialDescendant string) (bool, error) {
 	// If they're the same commit, return true
 	if potentialAncestor == potentialDescendant {
 		return true, nil
 	}
 
 	// Get the descendant commit
-	commit, err := objects.GetCommit(repoRoot, potentialDescendant)
+	commit, err := objects.GetCommit(repo.Root, potentialDescendant)
 	if err != nil {
-		return false, fmt.Errorf("failed to get descendant commit: %w", err)
+		return false, core.ObjectError("failed to get descendant commit", err)
 	}
 
-	// BFS to find the ancestor
-	visited := make(map[string]bool)
-	queue := commit.Parents
-
-	for len(queue) > 0 {
-		current := queue[0]
-		queue = queue[1:]
-
-		// Skip if already visited
-		if visited[current] {
-			continue
-		}
-		visited[current] = true
-
-		// Check if this is the ancestor we're looking for
-		if current == potentialAncestor {
+	// Check if any parent of the descendant is the potential ancestor
+	for _, parent := range commit.Parents {
+		if parent == potentialAncestor {
 			return true, nil
 		}
 
-		// Get the current commit's parents and add them to the queue
-		currentCommit, err := objects.GetCommit(repoRoot, current)
+		// Recursively check the parent's ancestors
+		isAnc, err := isAncestor(repo, potentialAncestor, parent)
 		if err != nil {
-			return false, fmt.Errorf("failed to get commit %s: %w", current, err)
+			return false, err
 		}
-
-		queue = append(queue, currentCommit.Parents...)
+		if isAnc {
+			return true, nil
+		}
 	}
 
-	// If we've traversed all reachable commits and haven't found the ancestor, return false
 	return false, nil
 }
 
+// Store the command reference for use by the handler
+var branchCmd *cobra.Command
+
 func init() {
-	rootCmd.AddCommand(branchCmd)
-	branchCmd.Flags().BoolP("list", "l", false, "List all branches")
+	// Create the command
+	branchCmd = NewRepoCommand(
+		"branch",
+		"List, create, or delete branches",
+		BranchHandler,
+	)
+
+	// Add flags
+	branchCmd.Flags().BoolP("list", "l", false, "List branches")
 	branchCmd.Flags().StringP("delete", "d", "", "Delete a branch")
-	branchCmd.Flags().StringP("rename", "m", "", "Rename a branch")
-	branchCmd.Flags().BoolP("force", "f", false, "Force deletion of unmerged branches")
+	branchCmd.Flags().BoolP("force", "f", false, "Force delete a branch even if not merged")
+	branchCmd.Flags().StringP("rename", "m", "", "Rename a branch with format 'oldname newname'")
+
+	rootCmd.AddCommand(branchCmd)
 }

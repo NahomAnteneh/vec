@@ -10,12 +10,13 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/NahomAnteneh/vec/core"
 	"github.com/NahomAnteneh/vec/utils" // for utility functions (e.g., HashBytes)
 )
 
 // TreeEntry represents a single entry in a tree—either a blob (file) or a subtree.
 type TreeEntry struct {
-	Mode int32  // File mode (e.g., 100644 for files, 040000 for trees)
+	Mode int32  // File mode (e.g., 0644 for files, 040000 for trees)
 	Name string // Basename (e.g., "file.txt" or directory name)
 	Hash string // SHA-256 hash (hex string) of the blob or subtree.
 	Type string // "blob" or "tree"
@@ -36,7 +37,7 @@ func NewTreeObject() *TreeObject {
 }
 
 // Serialize converts the TreeObject into a Git-compatible byte slice.
-// Format: <mode> <name>\x00<hash> for each entry, sorted by name for deterministic hashing.
+// Format: <mode> <n>\x00<hash> for each entry, sorted by name for deterministic hashing.
 func (t *TreeObject) Serialize() ([]byte, error) {
 	if t == nil {
 		return nil, fmt.Errorf("cannot serialize nil TreeObject")
@@ -67,7 +68,7 @@ func (t *TreeObject) Serialize() ([]byte, error) {
 			return nil, fmt.Errorf("invalid hash '%s' for entry '%s': %w", entry.Hash, entry.Name, err)
 		}
 
-		// Write "<mode> <name>\x00<hash>"
+		// Write "<mode> <n>\x00<hash>"
 		fmt.Fprintf(&buf, "%s %s\x00", modeStr, entry.Name)
 		if _, err := buf.Write(hashBytes); err != nil {
 			return nil, fmt.Errorf("failed to write hash for entry '%s': %w", entry.Name, err)
@@ -157,13 +158,19 @@ func (t *TreeObject) SetTreeID() (string, error) {
 	return hash, nil
 }
 
-// createTreeObject serializes entries into a tree object, stores it on disk, and returns its hash.
+// CreateTreeObject serializes entries into a tree object, stores it on disk, and returns its hash (legacy function).
 func CreateTreeObject(entries []TreeEntry) (string, error) {
 	repoRoot, err := utils.GetVecRoot()
 	if err != nil {
 		return "", err
 	}
 
+	repo := core.NewRepository(repoRoot)
+	return CreateTreeObjectRepo(repo, entries)
+}
+
+// CreateTreeObjectRepo serializes entries into a tree object using Repository context.
+func CreateTreeObjectRepo(repo *core.Repository, entries []TreeEntry) (string, error) {
 	var content bytes.Buffer
 	for _, entry := range entries {
 		if entry.Name == "" {
@@ -187,7 +194,7 @@ func CreateTreeObject(entries []TreeEntry) (string, error) {
 	fullContent := append([]byte(header), treeContent...)
 
 	hash := utils.HashBytes("tree", fullContent)
-	objectPath := GetObjectPath(repoRoot, hash)
+	objectPath := GetObjectPathRepo(repo, hash)
 
 	// Ensure the directory exists.
 	if err := utils.EnsureDirExists(filepath.Dir(objectPath)); err != nil {
@@ -202,9 +209,7 @@ func CreateTreeObject(entries []TreeEntry) (string, error) {
 	return hash, nil
 }
 
-// GetTree retrieves and deserializes a TreeObject from disk given its hash.
-// This function accepts either one parameter (hash) for backward compatibility
-// or two parameters (repoRoot, hash) for newer code.
+// GetTree retrieves and deserializes a TreeObject from disk given its hash (legacy function).
 func GetTree(repoRootOrHash string, hashOrEmpty ...string) (*TreeObject, error) {
 	var repoRoot, hash string
 
@@ -223,11 +228,17 @@ func GetTree(repoRootOrHash string, hashOrEmpty ...string) (*TreeObject, error) 
 		hash = hashOrEmpty[0]
 	}
 
+	repo := core.NewRepository(repoRoot)
+	return GetTreeRepo(repo, hash)
+}
+
+// GetTreeRepo retrieves and deserializes a TreeObject from disk using Repository context.
+func GetTreeRepo(repo *core.Repository, hash string) (*TreeObject, error) {
 	if len(hash) != 64 {
 		return nil, fmt.Errorf("invalid hash length: expected 64, got %d", len(hash))
 	}
 
-	objectPath := GetObjectPath(repoRoot, hash)
+	objectPath := GetObjectPathRepo(repo, hash)
 	content, err := os.ReadFile(objectPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read tree file '%s': %w", objectPath, err)
@@ -260,9 +271,14 @@ func GetTree(repoRootOrHash string, hashOrEmpty ...string) (*TreeObject, error) 
 	return tree, nil
 }
 
-// buildTreeRecursively constructs tree entries for a given directory key in the map.
-// It adds files and then finds immediate subdirectories, recursively building subtrees.
+// BuildTreeRecursively constructs tree entries for a given directory key in the map (legacy function).
 func BuildTreeRecursively(dirPath string, treeMap map[string][]TreeEntry, repoRoot string) ([]TreeEntry, error) {
+	repo := core.NewRepository(repoRoot)
+	return BuildTreeRecursivelyRepo(dirPath, treeMap, repo)
+}
+
+// BuildTreeRecursivelyRepo constructs tree entries using Repository context.
+func BuildTreeRecursivelyRepo(dirPath string, treeMap map[string][]TreeEntry, repo *core.Repository) ([]TreeEntry, error) {
 	var entries []TreeEntry
 
 	// Add files directly in this directory.
@@ -309,11 +325,11 @@ func BuildTreeRecursively(dirPath string, treeMap map[string][]TreeEntry, repoRo
 		} else {
 			fullSubDir = filepath.Join(dirPath, subDir)
 		}
-		subEntries, err := BuildTreeRecursively(fullSubDir, treeMap, repoRoot)
+		subEntries, err := BuildTreeRecursivelyRepo(fullSubDir, treeMap, repo)
 		if err != nil {
 			return nil, err
 		}
-		subTreeHash, err := CreateTreeObject(subEntries)
+		subTreeHash, err := CreateTreeObjectRepo(repo, subEntries)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create subtree for '%s': %w", fullSubDir, err)
 		}

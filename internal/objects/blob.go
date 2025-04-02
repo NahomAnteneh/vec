@@ -7,18 +7,25 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/NahomAnteneh/vec/core"
 	"github.com/NahomAnteneh/vec/utils"
 )
 
-// CreateBlob creates a new blob object, including the header.
+// CreateBlob creates a new blob object, including the header (legacy function).
 func CreateBlob(repoRoot string, content []byte) (string, error) {
+	repo := core.NewRepository(repoRoot)
+	return CreateBlobRepo(repo, content)
+}
+
+// CreateBlobRepo creates a new blob object using Repository context.
+func CreateBlobRepo(repo *core.Repository, content []byte) (string, error) {
 	header := fmt.Sprintf("blob %d\x00", len(content))
 	var buf bytes.Buffer
 	buf.WriteString(header)
 	buf.Write(content)
 
 	hash := utils.HashBytes("blob", content) // Hash includes header
-	objectPath := getObjectPath(repoRoot, hash)
+	objectPath := GetObjectPathRepo(repo, hash)
 	objectDir := filepath.Dir(objectPath)
 
 	// Ensure the object directory exists.
@@ -40,9 +47,15 @@ func CreateBlob(repoRoot string, content []byte) (string, error) {
 	return hash, nil
 }
 
-// GetBlob retrieves a blob object by its hash.
+// GetBlob retrieves a blob object by its hash (legacy function).
 func GetBlob(repoRoot string, hash string) ([]byte, error) {
-	objectPath := getObjectPath(repoRoot, hash)
+	repo := core.NewRepository(repoRoot)
+	return GetBlobRepo(repo, hash)
+}
+
+// GetBlobRepo retrieves a blob object by its hash using Repository context.
+func GetBlobRepo(repo *core.Repository, hash string) ([]byte, error) {
+	objectPath := GetObjectPathRepo(repo, hash)
 
 	file, err := os.Open(objectPath)
 	if err != nil {
@@ -64,9 +77,4 @@ func GetBlob(repoRoot string, hash string) ([]byte, error) {
 
 	// Return only the file content
 	return content[headerEnd+1:], nil
-}
-
-// getObjectPath returns the path to a blob object.  Now uses the two-char subdirectory.
-func getObjectPath(repoRoot string, hash string) string {
-	return filepath.Join(repoRoot, ".vec", "objects", hash[:2], hash[2:])
 }

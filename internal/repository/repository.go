@@ -5,15 +5,23 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/NahomAnteneh/vec/core"
 	"github.com/NahomAnteneh/vec/utils"
 )
 
+// CreateRepository initializes a new Vec repository at the specified directory (legacy function)
 func CreateRepository(dir string) error {
-	vecDir := filepath.Join(dir, ".vec")
+	repo := core.NewRepository(dir)
+	return CreateRepo(repo)
+}
+
+// CreateRepo initializes a new Vec repository using Repository context
+func CreateRepo(repo *core.Repository) error {
+	vecDir := repo.VecDir
 
 	// Check if repository already exists.
 	if utils.FileExists(vecDir) {
-		return fmt.Errorf("vec repository already initialized at %s", dir)
+		return fmt.Errorf("vec repository already initialized at %s", repo.Root)
 	}
 
 	// Create .vec directory.
@@ -24,6 +32,8 @@ func CreateRepository(dir string) error {
 	// Create subdirectories.
 	subDirs := []string{
 		filepath.Join(vecDir, "objects"),
+		filepath.Join(vecDir, "objects", "pack"),
+		filepath.Join(vecDir, "objects", "info"),
 		filepath.Join(vecDir, "refs", "heads"),
 		filepath.Join(vecDir, "refs", "remotes"),
 		filepath.Join(vecDir, "logs", "refs", "heads"),
@@ -33,6 +43,18 @@ func CreateRepository(dir string) error {
 		if err := os.MkdirAll(subDir, 0755); err != nil {
 			return fmt.Errorf("failed to create subdirectory %s: %w", subDir, err)
 		}
+	}
+
+	// Create an empty packfile index to initialize proper structure
+	packInfoFile := filepath.Join(vecDir, "objects", "info", "packs")
+	if err := os.WriteFile(packInfoFile, []byte(""), 0644); err != nil {
+		return fmt.Errorf("failed to create packfile info file: %w", err)
+	}
+
+	// Create an empty alternates file for potential alternate object stores
+	alternatesFile := filepath.Join(vecDir, "objects", "info", "alternates")
+	if err := os.WriteFile(alternatesFile, []byte(""), 0644); err != nil {
+		return fmt.Errorf("failed to create alternates file: %w", err)
 	}
 
 	// Create HEAD file.
@@ -51,7 +73,16 @@ func CreateRepository(dir string) error {
 	return nil
 }
 
+// CreateRepositoryBare creates a bare repository at the specified directory (legacy function)
 func CreateRepositoryBare(dir string) error {
+	repo := core.NewRepository(dir)
+	return CreateBareRepo(repo)
+}
+
+// CreateBareRepo creates a bare repository using Repository context
+func CreateBareRepo(repo *core.Repository) error {
+	dir := repo.Root
+
 	// Check if directory already exists.
 	if utils.FileExists(dir) {
 		// If the directory exists, check if it's empty
@@ -73,6 +104,8 @@ func CreateRepositoryBare(dir string) error {
 	// Create subdirectories directly in the specified directory
 	subDirs := []string{
 		filepath.Join(dir, "objects"),
+		filepath.Join(dir, "objects", "pack"),
+		filepath.Join(dir, "objects", "info"),
 		filepath.Join(dir, "refs", "heads"),
 		filepath.Join(dir, "refs", "remotes"),
 		filepath.Join(dir, "logs", "refs", "heads"),
@@ -82,6 +115,18 @@ func CreateRepositoryBare(dir string) error {
 		if err := os.MkdirAll(subDir, 0755); err != nil {
 			return fmt.Errorf("failed to create subdirectory %s: %w", subDir, err)
 		}
+	}
+
+	// Create an empty packfile index to initialize proper structure
+	packInfoFile := filepath.Join(dir, "objects", "info", "packs")
+	if err := os.WriteFile(packInfoFile, []byte(""), 0644); err != nil {
+		return fmt.Errorf("failed to create packfile info file: %w", err)
+	}
+
+	// Create an empty alternates file for potential alternate object stores
+	alternatesFile := filepath.Join(dir, "objects", "info", "alternates")
+	if err := os.WriteFile(alternatesFile, []byte(""), 0644); err != nil {
+		return fmt.Errorf("failed to create alternates file: %w", err)
 	}
 
 	// Create HEAD file

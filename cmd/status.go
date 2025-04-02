@@ -8,10 +8,10 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/NahomAnteneh/vec/core"
 	"github.com/NahomAnteneh/vec/internal/objects"
 	"github.com/NahomAnteneh/vec/internal/staging"
 	"github.com/NahomAnteneh/vec/utils"
-	"github.com/spf13/cobra"
 )
 
 var (
@@ -19,45 +19,27 @@ var (
 	statusBranch bool
 )
 
-var statusCmd = &cobra.Command{
-	Use:   "status",
-	Short: "Show the working tree status",
-	Args:  cobra.NoArgs,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		repoRoot, err := utils.GetVecRoot()
-		if err != nil {
-			return err
-		}
-		return status(repoRoot)
-	},
-}
-
-func init() {
-	rootCmd.AddCommand(statusCmd)
-	statusCmd.Flags().BoolVarP(&statusShort, "short", "s", false, "Give the output in the short-format")
-	statusCmd.Flags().BoolVarP(&statusBranch, "branch", "b", false, "Show branch information even in short-format")
-}
-
-func status(repoRoot string) error {
+// StatusHandler handles the 'status' command
+func StatusHandler(repo *core.Repository, args []string) error {
 	// Load the index
-	index, err := staging.LoadIndex(repoRoot)
+	index, err := staging.LoadIndexRepo(repo)
 	if err != nil {
 		return fmt.Errorf("failed to read index: %w", err)
 	}
 
 	// Get the HEAD commit and its tree
-	headCommitID, err := utils.GetHeadCommit(repoRoot)
+	headCommitID, err := repo.ReadHead()
 	if err != nil {
 		return fmt.Errorf("failed to get HEAD commit: %w", err)
 	}
 
 	var commitTree *objects.TreeObject
 	if headCommitID != "" {
-		headCommit, err := objects.GetCommit(repoRoot, headCommitID)
+		headCommit, err := objects.GetCommit(repo.Root, headCommitID)
 		if err != nil {
 			return fmt.Errorf("failed to load HEAD commit: %w", err)
 		}
-		commitTree, err = objects.GetTree(repoRoot, headCommit.Tree)
+		commitTree, err = objects.GetTree(repo.Root, headCommit.Tree)
 		if err != nil {
 			return fmt.Errorf("failed to load commit tree: %w", err)
 		}
@@ -66,13 +48,13 @@ func status(repoRoot string) error {
 	}
 
 	// Compare states
-	statusInfo, err := compareStatus(repoRoot, index, commitTree)
+	statusInfo, err := compareStatusRepo(repo, index, commitTree)
 	if err != nil {
 		return fmt.Errorf("failed to compare status: %w", err)
 	}
 
 	// Get current branch
-	branchName, err := utils.GetCurrentBranch(repoRoot)
+	branchName, err := repo.GetCurrentBranch()
 	if err != nil {
 		return fmt.Errorf("failed to get current branch: %w", err)
 	}
@@ -85,6 +67,17 @@ func status(repoRoot string) error {
 	}
 
 	return nil
+}
+
+func init() {
+	statusCmd := NewRepoCommand(
+		"status",
+		"Show the working tree status",
+		StatusHandler,
+	)
+	statusCmd.Flags().BoolVarP(&statusShort, "short", "s", false, "Give the output in the short-format")
+	statusCmd.Flags().BoolVarP(&statusBranch, "branch", "b", false, "Show branch information even in short-format")
+	rootCmd.AddCommand(statusCmd)
 }
 
 // StatusInfo holds all the information about the working tree status
@@ -250,213 +243,197 @@ func computeFileBlobHash(path string) (string, error) {
 	return utils.HashBytes("blob", data), nil
 }
 
-// compareStatus compares the commit tree, index, and working directory.
-// Returns a StatusInfo struct with all the status information.
-func compareStatus(repoRoot string, index *staging.Index, commitTree *objects.TreeObject) (*StatusInfo, error) {
-	// Initialize result with capacity estimates
-	result := &StatusInfo{
-		NewFiles:          make([]string, 0, 10),
-		StagedModified:    make([]string, 0, 10),
-		StagedDeleted:     make([]string, 0, 10),
-		Untracked:         make([]string, 0, 10),
-		ModifiedNotStaged: make([]string, 0, 10),
-		DeletedNotStaged:  make([]string, 0, 10),
-		Conflicts:         make([]string, 0, 5),
+// compareStatusRepo compares the working directory, index, and commit tree
+// to determine the status of files in the repository using Repository context
+func compareStatusRepo(repo *core.Repository, index *staging.Index, commitTree *objects.TreeObject) (*StatusInfo, error) {
+	status := &StatusInfo{
+		NewFiles:          []string{},
+		StagedModified:    []string{},
+		StagedDeleted:     []string{},
+		Untracked:         []string{},
+		ModifiedNotStaged: []string{},
+		DeletedNotStaged:  []string{},
+		Conflicts:         []string{},
 		IsClean:           true,
 	}
 
 	// Check for conflicts first
-	if index.HasConflicts() {
-		conflicts := index.GetConflicts()
-		for file := range conflicts {
-			result.Conflicts = append(result.Conflicts, file)
-			result.IsClean = false
-		}
-		sort.Strings(result.Conflicts)
-	}
-
-	// Build maps for efficient lookup
-	indexMap := make(map[string]string, len(index.Entries))  // path -> SHA256
-	indexStages := make(map[string]bool, len(index.Entries)) // paths that have any stage entry
-
 	for _, entry := range index.Entries {
-		if entry.Stage == 0 {
-			indexMap[entry.FilePath] = entry.SHA256
-		}
-		indexStages[entry.FilePath] = true
-	}
-
-	// Build commit tree map
-	commitTreeMap := make(map[string]objects.TreeEntry, 100) // path -> TreeEntry
-	buildCommitTreeMap(repoRoot, commitTree, "", commitTreeMap)
-
-	// Track files seen in the working directory to detect deletions
-	workingDirFiles := make(map[string]bool, 100)
-
-	// Use a sync.Map for thread-safe concurrent access
-	var fileHashes sync.Map
-
-	// Pre-compute file hashes for files we know we'll need
-	var hashWg sync.WaitGroup
-	filesToHash := make(chan string, 100)
-
-	// Start workers to hash files concurrently
-	const numWorkers = 4
-	for i := 0; i < numWorkers; i++ {
-		hashWg.Add(1)
-		go func() {
-			defer hashWg.Done()
-			for absPath := range filesToHash {
-				if hash, err := computeFileBlobHash(absPath); err == nil {
-					fileHashes.Store(absPath, hash)
+		if entry.Stage > 0 {
+			// This is a conflict entry; add if not already in the list
+			found := false
+			for _, path := range status.Conflicts {
+				if path == entry.FilePath {
+					found = true
+					break
 				}
 			}
-		}()
+			if !found {
+				status.Conflicts = append(status.Conflicts, entry.FilePath)
+				status.IsClean = false
+			}
+		}
 	}
 
-	// Walk the working directory to find all files
-	err := filepath.Walk(repoRoot, func(absPath string, info os.FileInfo, err error) error {
+	// Build a map from file path to tree entry from the commit tree
+	commitTreeMap := make(map[string]objects.TreeEntry)
+	if commitTree != nil {
+		buildCommitTreeMapRepo(repo, commitTree, "", commitTreeMap)
+	}
+
+	// Build a map of staged files
+	stagedFiles := make(map[string]staging.IndexEntry)
+	for _, entry := range index.Entries {
+		if entry.Stage == 0 { // Only consider non-conflict entries
+			stagedFiles[entry.FilePath] = entry
+		}
+	}
+
+	// Compare commit tree with index to find staged changes
+	for path, treeEntry := range commitTreeMap {
+		indexEntry, inIndex := stagedFiles[path]
+		if !inIndex {
+			// File in commit but not in index = staged deletion
+			status.StagedDeleted = append(status.StagedDeleted, path)
+			status.IsClean = false
+		} else if inIndex && indexEntry.SHA256 != treeEntry.Hash {
+			// File in both, but different hash = modified in index
+			status.StagedModified = append(status.StagedModified, path)
+			status.IsClean = false
+		}
+	}
+
+	// Check for new files in index (not in commit)
+	for path := range stagedFiles {
+		if _, inTree := commitTreeMap[path]; !inTree {
+			status.NewFiles = append(status.NewFiles, path)
+			status.IsClean = false
+		}
+	}
+
+	// Compare index with working directory
+	// Get a list of all files in the working directory
+	var workingDirFiles []string
+	err := filepath.Walk(repo.Root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
-
 		// Skip .vec directory
-		if strings.Contains(absPath, string(filepath.Separator)+".vec"+string(filepath.Separator)) {
-			if info.IsDir() {
-				return filepath.SkipDir
-			}
-			return nil
+		if info.IsDir() && (info.Name() == ".vec" || strings.HasPrefix(path, filepath.Join(repo.Root, ".vec"))) {
+			return filepath.SkipDir
 		}
-
-		// Skip ignored files and directories
-		if isIgnored, _ := utils.IsIgnored(repoRoot, absPath); isIgnored {
-			if info.IsDir() {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-
 		// Skip directories
 		if info.IsDir() {
 			return nil
 		}
-
-		relPath, err := filepath.Rel(repoRoot, absPath)
-		if err != nil {
-			return fmt.Errorf("failed to get relative path: %w", err)
+		// Check if file should be ignored
+		isIgnored, _ := utils.IsIgnored(repo.Root, path)
+		if isIgnored {
+			return nil
 		}
-
-		// Use normalized path throughout
-		relPath = filepath.ToSlash(relPath)
-		workingDirFiles[relPath] = true
-
-		// Queue this file for hashing
-		filesToHash <- absPath
+		relPath, err := filepath.Rel(repo.Root, path)
+		if err != nil {
+			return err
+		}
+		workingDirFiles = append(workingDirFiles, relPath)
 		return nil
 	})
-
-	// Close the channel after all files are queued
-	close(filesToHash)
-
-	// Wait for all hashing to complete
-	hashWg.Wait()
-
 	if err != nil {
 		return nil, fmt.Errorf("failed to walk working directory: %w", err)
 	}
 
-	// Process working directory files
-	for relPath := range workingDirFiles {
-		absPath := filepath.Join(repoRoot, relPath)
+	// Create a map for easy lookup
+	workingDirMap := make(map[string]bool)
+	for _, path := range workingDirFiles {
+		workingDirMap[path] = true
+	}
 
-		// Get file hash
-		hashVal, ok := fileHashes.Load(absPath)
-		if !ok {
-			continue // Skip if we couldn't get the hash
-		}
-		currentHash := hashVal.(string)
+	// Create a wait group for concurrent hash computation
+	var wg sync.WaitGroup
+	// Semaphore to limit concurrency
+	semaphore := make(chan struct{}, 10)
+	// Mutex for synchronizing access to the status
+	var mutex sync.Mutex
 
-		indexHash, inIndex := indexMap[relPath]
-		commitEntry, inCommit := commitTreeMap[relPath]
+	// Process each file in the index
+	for path, entry := range stagedFiles {
+		if _, inWorkingDir := workingDirMap[path]; !inWorkingDir {
+			// File in index but not in working directory = deleted in working directory
+			status.DeletedNotStaged = append(status.DeletedNotStaged, path)
+			status.IsClean = false
+		} else {
+			// File in both, compare content
+			wg.Add(1)
+			semaphore <- struct{}{}
+			go func(filePath string, indexEntry staging.IndexEntry) {
+				defer wg.Done()
+				defer func() { <-semaphore }()
 
-		// Check for conflicts first
-		if _, isConflict := index.GetEntry(relPath, 1); isConflict {
-			// Already handled in the conflict check above
-			continue
-		}
+				absPath := filepath.Join(repo.Root, filePath)
+				content, err := os.ReadFile(absPath)
+				if err != nil {
+					return // Skip files we can't read
+				}
 
-		// Case 1: File in commit, index, and working directory
-		if inCommit && inIndex {
-			if indexHash != commitEntry.Hash {
-				result.StagedModified = append(result.StagedModified, relPath)
-				result.IsClean = false
-			}
-
-			if currentHash != indexHash {
-				result.ModifiedNotStaged = append(result.ModifiedNotStaged, relPath)
-				result.IsClean = false
-			}
-		} else if inIndex && !inCommit {
-			// Case 2: File in index but not in commit (new file)
-			result.NewFiles = append(result.NewFiles, relPath)
-			result.IsClean = false
-
-			if currentHash != indexHash {
-				result.ModifiedNotStaged = append(result.ModifiedNotStaged, relPath)
-			}
-		} else if !inIndex && !inCommit {
-			// Case 3: File not in index or commit (untracked)
-			result.Untracked = append(result.Untracked, relPath)
-			result.IsClean = false
+				fileHash := utils.HashBytes("blob", content)
+				if fileHash != indexEntry.SHA256 {
+					mutex.Lock()
+					status.ModifiedNotStaged = append(status.ModifiedNotStaged, filePath)
+					status.IsClean = false
+					mutex.Unlock()
+				}
+			}(path, entry)
 		}
 	}
 
-	// Check for deleted files
-	// Files in commit but not in working directory or index
-	for relPath := range commitTreeMap {
-		_, inIndex := indexMap[relPath]
-		inWorkingDir := workingDirFiles[relPath]
-
-		if !inIndex && !inWorkingDir {
-			result.StagedDeleted = append(result.StagedDeleted, relPath)
-			result.IsClean = false
-		} else if inIndex && !inWorkingDir {
-			result.DeletedNotStaged = append(result.DeletedNotStaged, relPath)
-			result.IsClean = false
+	// Process each file in the working directory
+	for path := range workingDirMap {
+		if _, inIndex := stagedFiles[path]; !inIndex {
+			// File in working directory but not in index = untracked
+			status.Untracked = append(status.Untracked, path)
+			status.IsClean = false
 		}
 	}
 
-	// Sort all arrays for consistent output
-	sort.Strings(result.NewFiles)
-	sort.Strings(result.StagedModified)
-	sort.Strings(result.StagedDeleted)
-	sort.Strings(result.Untracked)
-	sort.Strings(result.ModifiedNotStaged)
-	sort.Strings(result.DeletedNotStaged)
+	// Wait for all concurrent hash computations to complete
+	wg.Wait()
 
-	return result, nil
+	// Sort all lists for consistent output
+	sort.Strings(status.NewFiles)
+	sort.Strings(status.StagedModified)
+	sort.Strings(status.StagedDeleted)
+	sort.Strings(status.Untracked)
+	sort.Strings(status.ModifiedNotStaged)
+	sort.Strings(status.DeletedNotStaged)
+	sort.Strings(status.Conflicts)
+
+	return status, nil
 }
 
-// buildCommitTreeMap recursively builds a map of commit tree entries.
-func buildCommitTreeMap(repoRoot string, tree *objects.TreeObject, parentPath string, treeMap map[string]objects.TreeEntry) {
-	if tree == nil {
-		return
-	}
+// Legacy function for backward compatibility
+func compareStatus(repo *core.Repository, index *staging.Index, commitTree *objects.TreeObject) (*StatusInfo, error) {
+	return compareStatusRepo(repo, index, commitTree)
+}
 
+// buildCommitTreeMapRepo recursively builds a map of file paths to tree entries from a tree object using Repository context
+func buildCommitTreeMapRepo(repo *core.Repository, tree *objects.TreeObject, parentPath string, treeMap map[string]objects.TreeEntry) {
 	for _, entry := range tree.Entries {
-		entryPath := filepath.Join(parentPath, entry.Name)
-		// Normalize path separators
-		entryPath = strings.ReplaceAll(entryPath, string(filepath.Separator), "/")
-
+		path := filepath.Join(parentPath, entry.Name)
 		if entry.Type == "blob" {
-			treeMap[entryPath] = entry
+			treeMap[path] = entry
 		} else if entry.Type == "tree" {
-			subTree, err := objects.GetTree(repoRoot, entry.Hash)
+			subTree, err := objects.GetTree(repo.Root, entry.Hash)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: Error getting subtree %s: %v\n", entry.Hash, err)
+				// Skip subtrees we can't load
 				continue
 			}
-			buildCommitTreeMap(repoRoot, subTree, entryPath, treeMap)
+			buildCommitTreeMapRepo(repo, subTree, path, treeMap)
 		}
 	}
+}
+
+// Legacy function for backward compatibility
+func buildCommitTreeMap(repoRoot string, tree *objects.TreeObject, parentPath string, treeMap map[string]objects.TreeEntry) {
+	repo := core.NewRepository(repoRoot)
+	buildCommitTreeMapRepo(repo, tree, parentPath, treeMap)
 }
