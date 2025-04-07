@@ -14,16 +14,15 @@ import (
 
 var (
 	// Remote command options
-	remoteVerbose      bool
-	remoteDetailed     bool
-	remoteDetailedInfo bool
-	remotePrune        bool
-	remoteForce        bool
-	remoteTracking     bool
-	remoteTimeout      int
-	remoteTags         bool
-	remoteQuiet        bool
-	remoteVerboseAuth  bool
+	remoteVerbose     bool
+	remoteDetailed    bool
+	remotePrune       bool
+	remoteForce       bool
+	remoteTracking    bool
+	remoteTimeout     int
+	remoteTags        bool
+	remoteQuiet       bool
+	remoteVerboseAuth bool
 )
 
 // remoteCmd represents the remote command

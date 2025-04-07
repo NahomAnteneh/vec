@@ -9,11 +9,11 @@ import (
 	"github.com/NahomAnteneh/vec/utils"
 )
 
-// CreateRepository initializes a new Vec repository at the specified directory (legacy function)
-func CreateRepository(dir string) error {
-	repo := core.NewRepository(dir)
-	return CreateRepo(repo)
-}
+// // CreateRepository initializes a new Vec repository at the specified directory (legacy function)
+// func CreateRepository(dir string) error {
+// 	repo := core.NewRepository(dir)
+// 	return CreateRepo(repo)
+// }
 
 // CreateRepo initializes a new Vec repository using Repository context
 func CreateRepo(repo *core.Repository) error {
@@ -74,10 +74,10 @@ func CreateRepo(repo *core.Repository) error {
 }
 
 // CreateRepositoryBare creates a bare repository at the specified directory (legacy function)
-func CreateRepositoryBare(dir string) error {
-	repo := core.NewRepository(dir)
-	return CreateBareRepo(repo)
-}
+// func CreateRepositoryBare(dir string) error {
+// 	repo := core.NewRepository(dir)
+// 	return CreateBareRepo(repo)
+// }
 
 // CreateBareRepo creates a bare repository using Repository context
 func CreateBareRepo(repo *core.Repository) error {
