@@ -1,4 +1,3 @@
-// // filepath: /home/nahom/Dev/vec/internal/objects/tree.go
 package objects
 
 import (
@@ -11,22 +10,23 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/NahomAnteneh/vec/utils"
+	"github.com/NahomAnteneh/vec/core"
+	"github.com/NahomAnteneh/vec/utils" // for utility functions (e.g., HashBytes)
 )
 
-// TreeEntry represents a single entry in a TreeObject, such as a file or subdirectory.
+// TreeEntry represents a single entry in a tree—either a blob (file) or a subtree.
 type TreeEntry struct {
-	Mode     int32  // File mode in octal (e.g., 100644 for files, 040000 for directories)
-	Name     string // Basename of the entry (e.g., "file.txt")
-	Hash     string // SHA-256 hash of the blob or tree (hex string)
-	Type     string // "blob" or "tree" (inferred from Mode, not serialized)
-	FullPath string // Full relative path (e.g., "src/file.txt", for convenience, not serialized)
+	Mode int32  // File mode (e.g., 0644 for files, 040000 for trees)
+	Name string // Basename (e.g., "file.txt" or directory name)
+	Hash string // SHA-256 hash (hex string) of the blob or subtree.
+	Type string // "blob" or "tree"
+	// FullPath string // Full relative path (only used when building the map)
 }
 
-// TreeObject represents a directory snapshot in the repository.
+// TreeObject represents a Git-style tree object.
 type TreeObject struct {
-	TreeID  string      // SHA-256 hash of the serialized tree data
-	Entries []TreeEntry // Direct children (files or subdirectories)
+	TreeID  string
+	Entries []TreeEntry
 }
 
 // NewTreeObject creates a new, empty TreeObject.
@@ -37,7 +37,7 @@ func NewTreeObject() *TreeObject {
 }
 
 // Serialize converts the TreeObject into a Git-compatible byte slice.
-// Format: <mode> <name>\x00<hash> for each entry, sorted by name for deterministic hashing.
+// Format: <mode> <n>\x00<hash> for each entry, sorted by name for deterministic hashing.
 func (t *TreeObject) Serialize() ([]byte, error) {
 	if t == nil {
 		return nil, fmt.Errorf("cannot serialize nil TreeObject")
@@ -61,13 +61,14 @@ func (t *TreeObject) Serialize() ([]byte, error) {
 		}
 
 		// Mode as 6-digit octal string
-		modeStr := fmt.Sprintf("%06o", entry.Mode)
+		modeStr := fmt.Sprintf("%06d", entry.Mode)
+
 		hashBytes, err := hex.DecodeString(entry.Hash)
 		if err != nil {
 			return nil, fmt.Errorf("invalid hash '%s' for entry '%s': %w", entry.Hash, entry.Name, err)
 		}
 
-		// Write "<mode> <name>\x00<hash>"
+		// Write "<mode> <n>\x00<hash>"
 		fmt.Fprintf(&buf, "%s %s\x00", modeStr, entry.Name)
 		if _, err := buf.Write(hashBytes); err != nil {
 			return nil, fmt.Errorf("failed to write hash for entry '%s': %w", entry.Name, err)
@@ -115,7 +116,7 @@ func DeserializeTreeObject(data []byte) (*TreeObject, error) {
 		pos += 32
 
 		// Parse mode and infer type
-		mode, err := strconv.ParseInt(modeStr, 8, 32)
+		mode, err := strconv.ParseInt(modeStr, 10, 32)
 		if err != nil {
 			return nil, fmt.Errorf("invalid mode '%s' for entry '%s': %w", modeStr, name, err)
 		}
@@ -131,6 +132,8 @@ func DeserializeTreeObject(data []byte) (*TreeObject, error) {
 			Type: entryType,
 		})
 	}
+
+	tree.SetTreeID()
 
 	return tree, nil
 }
@@ -155,127 +158,19 @@ func (t *TreeObject) SetTreeID() (string, error) {
 	return hash, nil
 }
 
-// CreateTreeFromEntries constructs a tree object from a list of entries, handling subtrees.
-// Returns the hash of the root tree.
-func CreateTreeFromEntries(repoRoot string, entries []TreeEntry) (string, error) {
-	if repoRoot == "" {
-		return "", fmt.Errorf("repository root path cannot be empty")
-	}
-	if len(entries) == 0 {
-		return "", fmt.Errorf("no entries provided to create tree")
-	}
-
-	// Build a map of directory path -> entries.
-	// Also, ensure that every intermediate directory exists as a key.
-	treeMap := make(map[string][]TreeEntry)
-	for _, entry := range entries {
-		if entry.FullPath == "" {
-			return "", fmt.Errorf("entry with hash '%s' has empty FullPath", entry.Hash)
-		}
-		// Split the full path and add every intermediate directory
-		parts := strings.Split(entry.FullPath, string(filepath.Separator))
-		// For "a/b/c.txt", add keys for "a" and "a/b"
-		for i := 1; i < len(parts); i++ {
-			dir := filepath.Join(parts[:i]...)
-			if _, exists := treeMap[dir]; !exists {
-				treeMap[dir] = []TreeEntry{}
-			}
-		}
-		// Add the file into its parent directory key.
-		dirPath := filepath.Dir(entry.FullPath)
-		if dirPath == "." {
-			dirPath = ""
-		}
-		treeMap[dirPath] = append(treeMap[dirPath], entry)
-	}
-
-	// Build the tree hierarchy for the root directory ("").
-	rootEntries, err := buildTree(repoRoot, "", treeMap)
+// CreateTreeObject serializes entries into a tree object, stores it on disk, and returns its hash (legacy function).
+func CreateTreeObject(entries []TreeEntry) (string, error) {
+	repoRoot, err := utils.GetVecRoot()
 	if err != nil {
-		return "", fmt.Errorf("failed to build root tree: %w", err)
+		return "", err
 	}
-	return createTreeObject(repoRoot, rootEntries)
+
+	repo := core.NewRepository(repoRoot)
+	return CreateTreeObjectRepo(repo, entries)
 }
 
-// buildTree recursively constructs tree entries for a given directory path.
-func buildTree(repoRoot, dirPath string, treeMap map[string][]TreeEntry) ([]TreeEntry, error) {
-	var treeEntries []TreeEntry
-
-	// Add files directly in this directory.
-	if files, exists := treeMap[dirPath]; exists {
-		for _, file := range files {
-			// Only add files that are immediate children.
-			fileDir := filepath.Dir(file.FullPath)
-			if fileDir == dirPath || (dirPath == "" && fileDir == ".") {
-				// Files have mode 100644 (or other valid non-dir modes).
-				treeEntries = append(treeEntries, TreeEntry{
-					Mode: file.Mode,
-					Name: filepath.Base(file.FullPath),
-					Hash: file.Hash,
-					Type: "blob",
-				})
-			}
-		}
-	}
-
-	// Identify immediate subdirectories.
-	subDirs := make(map[string]struct{})
-	for path := range treeMap {
-		// Skip the current directory key.
-		if path == dirPath {
-			continue
-		}
-		// For root, consider all keys that are not empty.
-		if dirPath == "" {
-			parts := strings.Split(path, string(filepath.Separator))
-			if parts[0] != "" {
-				subDirs[parts[0]] = struct{}{}
-			}
-		} else if strings.HasPrefix(path, dirPath+string(filepath.Separator)) {
-			relative := strings.TrimPrefix(path, dirPath+string(filepath.Separator))
-			parts := strings.SplitN(relative, string(filepath.Separator), 2)
-			if len(parts) > 0 && parts[0] != "" {
-				subDirs[parts[0]] = struct{}{}
-			}
-		}
-	}
-
-	// Recursively build subtrees.
-	for subDir := range subDirs {
-		fullSubDir := subDir
-		if dirPath != "" {
-			fullSubDir = filepath.Join(dirPath, subDir)
-		}
-		subEntries, err := buildTree(repoRoot, fullSubDir, treeMap)
-		if err != nil {
-			return nil, err
-		}
-		subTreeHash, err := createTreeObject(repoRoot, subEntries)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create subtree for '%s': %w", fullSubDir, err)
-		}
-		treeEntries = append(treeEntries, TreeEntry{
-			Mode: 040000,
-			Name: subDir,
-			Hash: subTreeHash,
-			Type: "tree",
-		})
-	}
-
-	// Sort entries by name for consistency.
-	sort.Slice(treeEntries, func(i, j int) bool {
-		return treeEntries[i].Name < treeEntries[j].Name
-	})
-
-	return treeEntries, nil
-}
-
-// createTreeObject serializes entries into a tree object, stores it on disk, and returns its hash.
-func createTreeObject(repoRoot string, entries []TreeEntry) (string, error) {
-	if repoRoot == "" {
-		return "", fmt.Errorf("repository root path cannot be empty")
-	}
-
+// CreateTreeObjectRepo serializes entries into a tree object using Repository context.
+func CreateTreeObjectRepo(repo *core.Repository, entries []TreeEntry) (string, error) {
 	var content bytes.Buffer
 	for _, entry := range entries {
 		if entry.Name == "" {
@@ -284,7 +179,8 @@ func createTreeObject(repoRoot string, entries []TreeEntry) (string, error) {
 		if len(entry.Hash) != 64 {
 			return "", fmt.Errorf("invalid hash length for entry '%s': expected 64, got %d", entry.Name, len(entry.Hash))
 		}
-		modeStr := fmt.Sprintf("%06o", entry.Mode)
+		modeStr := fmt.Sprintf("%06d", entry.Mode)
+
 		hashBytes, err := hex.DecodeString(entry.Hash)
 		if err != nil {
 			return "", fmt.Errorf("invalid hash '%s' for entry '%s': %w", entry.Hash, entry.Name, err)
@@ -298,7 +194,7 @@ func createTreeObject(repoRoot string, entries []TreeEntry) (string, error) {
 	fullContent := append([]byte(header), treeContent...)
 
 	hash := utils.HashBytes("tree", fullContent)
-	objectPath := GetObjectPath(repoRoot, hash)
+	objectPath := GetObjectPathRepo(repo, hash)
 
 	// Ensure the directory exists.
 	if err := utils.EnsureDirExists(filepath.Dir(objectPath)); err != nil {
@@ -313,16 +209,36 @@ func createTreeObject(repoRoot string, entries []TreeEntry) (string, error) {
 	return hash, nil
 }
 
-// GetTree retrieves and deserializes a TreeObject from disk given its hash.
-func GetTree(repoRoot string, hash string) (*TreeObject, error) {
-	if repoRoot == "" {
-		return nil, fmt.Errorf("repository root path cannot be empty")
+// GetTree retrieves and deserializes a TreeObject from disk given its hash (legacy function).
+func GetTree(repoRootOrHash string, hashOrEmpty ...string) (*TreeObject, error) {
+	var repoRoot, hash string
+
+	// Determine if we're using the old or new calling convention
+	if len(hashOrEmpty) == 0 {
+		// Old style: GetTree(hash)
+		var err error
+		repoRoot, err = utils.GetVecRoot()
+		if err != nil {
+			return nil, err
+		}
+		hash = repoRootOrHash
+	} else {
+		// New style: GetTree(repoRoot, hash)
+		repoRoot = repoRootOrHash
+		hash = hashOrEmpty[0]
 	}
+
+	repo := core.NewRepository(repoRoot)
+	return GetTreeRepo(repo, hash)
+}
+
+// GetTreeRepo retrieves and deserializes a TreeObject from disk using Repository context.
+func GetTreeRepo(repo *core.Repository, hash string) (*TreeObject, error) {
 	if len(hash) != 64 {
 		return nil, fmt.Errorf("invalid hash length: expected 64, got %d", len(hash))
 	}
 
-	objectPath := GetObjectPath(repoRoot, hash)
+	objectPath := GetObjectPathRepo(repo, hash)
 	content, err := os.ReadFile(objectPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read tree file '%s': %w", objectPath, err)
@@ -355,11 +271,81 @@ func GetTree(repoRoot string, hash string) (*TreeObject, error) {
 	return tree, nil
 }
 
-// // GetObjectPath constructs the filesystem path for an object given its hash.
-// // Format: <repoRoot>/.vec/objects/<hash[:2]>/<hash[2:]>
-// func GetObjectPath(repoRoot, hash string) string {
-//     if len(hash) < 2 {
-//         return filepath.Join(repoRoot, ".vec", "objects", "invalid_hash")
-//     }
-//     return filepath.Join(repoRoot, ".vec", "objects", hash[:2], hash[2:])
-// }
+// BuildTreeRecursively constructs tree entries for a given directory key in the map (legacy function).
+func BuildTreeRecursively(dirPath string, treeMap map[string][]TreeEntry, repoRoot string) ([]TreeEntry, error) {
+	repo := core.NewRepository(repoRoot)
+	return BuildTreeRecursivelyRepo(dirPath, treeMap, repo)
+}
+
+// BuildTreeRecursivelyRepo constructs tree entries using Repository context.
+func BuildTreeRecursivelyRepo(dirPath string, treeMap map[string][]TreeEntry, repo *core.Repository) ([]TreeEntry, error) {
+	var entries []TreeEntry
+
+	// Add files directly in this directory.
+	if files, exists := treeMap[dirPath]; exists {
+		entries = append(entries, files...)
+	}
+
+	// Find immediate subdirectories.
+	subDirs := make(map[string]struct{})
+	for key := range treeMap {
+		// Skip the current directory key.
+		if key == dirPath {
+			continue
+		}
+
+		var rel string
+		if dirPath == "" {
+			// For root, the immediate subdirectory is the first component.
+			parts := strings.Split(key, string(filepath.Separator))
+			if len(parts) > 0 && parts[0] != "" {
+				rel = parts[0]
+			}
+		} else {
+			// For non-root directories, check keys with the prefix "dirPath/".
+			prefix := dirPath + string(filepath.Separator)
+			if strings.HasPrefix(key, prefix) {
+				remain := strings.TrimPrefix(key, prefix)
+				parts := strings.SplitN(remain, string(filepath.Separator), 2)
+				if len(parts) > 0 && parts[0] != "" {
+					rel = parts[0]
+				}
+			}
+		}
+		if rel != "" {
+			subDirs[rel] = struct{}{}
+		}
+	}
+
+	// For each immediate subdirectory, recursively build its subtree.
+	for subDir := range subDirs {
+		var fullSubDir string
+		if dirPath == "" {
+			fullSubDir = subDir
+		} else {
+			fullSubDir = filepath.Join(dirPath, subDir)
+		}
+		subEntries, err := BuildTreeRecursivelyRepo(fullSubDir, treeMap, repo)
+		if err != nil {
+			return nil, err
+		}
+		subTreeHash, err := CreateTreeObjectRepo(repo, subEntries)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create subtree for '%s': %w", fullSubDir, err)
+		}
+		// Append the subtree as a tree entry.
+		entries = append(entries, TreeEntry{
+			Mode: int32(040000),
+			Name: subDir,
+			Hash: subTreeHash,
+			Type: "tree",
+		})
+	}
+
+	// Sort entries by name for consistency.
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].Name < entries[j].Name
+	})
+
+	return entries, nil
+}

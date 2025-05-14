@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/NahomAnteneh/vec/core"
 	"github.com/NahomAnteneh/vec/utils"
 )
 
@@ -116,8 +117,14 @@ func deserializeCommit(data []byte) (*Commit, error) {
 	return commit, nil
 }
 
-// CreateCommit creates a new commit object, including the header.
+// CreateCommit creates a new commit object, including the header (legacy function).
 func CreateCommit(repoRoot, treeHash string, parentHashes []string, author, committer, message string, timestamp int64) (string, error) {
+	repo := core.NewRepository(repoRoot)
+	return CreateCommitRepo(repo, treeHash, parentHashes, author, committer, message, timestamp)
+}
+
+// CreateCommitRepo creates a new commit object using Repository context.
+func CreateCommitRepo(repo *core.Repository, treeHash string, parentHashes []string, author, committer, message string, timestamp int64) (string, error) {
 	commit := &Commit{
 		Tree:      treeHash,
 		Parents:   parentHashes,
@@ -134,7 +141,7 @@ func CreateCommit(repoRoot, treeHash string, parentHashes []string, author, comm
 	}
 
 	// Prepend the header
-	header := fmt.Sprintf("commit %d\n", len(data))
+	header := fmt.Sprintf("commit %d\x00", len(data))
 	var buf bytes.Buffer
 	buf.WriteString(header)
 	buf.Write(data)
@@ -145,7 +152,7 @@ func CreateCommit(repoRoot, treeHash string, parentHashes []string, author, comm
 	commit.CommitID = hash
 
 	// Store the commit object on disk
-	objectPath := GetObjectPath(repoRoot, hash)
+	objectPath := GetObjectPathRepo(repo, hash)
 	objectDir := filepath.Dir(objectPath)
 	if err := utils.EnsureDirExists(objectDir); err != nil {
 		return "", fmt.Errorf("failed to create directory for commit: %w", err)
@@ -157,16 +164,22 @@ func CreateCommit(repoRoot, treeHash string, parentHashes []string, author, comm
 	return hash, nil
 }
 
-// GetCommit reads a commit object from disk.
+// GetCommit reads a commit object from disk (legacy function).
 func GetCommit(repoRoot string, hash string) (*Commit, error) {
-	objectPath := GetObjectPath(repoRoot, hash)
+	repo := core.NewRepository(repoRoot)
+	return GetCommitRepo(repo, hash)
+}
+
+// GetCommitRepo reads a commit object from disk using Repository context.
+func GetCommitRepo(repo *core.Repository, hash string) (*Commit, error) {
+	objectPath := GetObjectPathRepo(repo, hash)
 	content, err := os.ReadFile(objectPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read commit file: %w", err)
 	}
 
 	// Find the header end
-	headerEnd := bytes.IndexByte(content, '\n')
+	headerEnd := bytes.IndexByte(content, '\x00')
 	if headerEnd == -1 {
 		return nil, fmt.Errorf("invalid commit format: missing header")
 	}
@@ -179,11 +192,6 @@ func GetCommit(repoRoot string, hash string) (*Commit, error) {
 	}
 	commit.CommitID = hash
 	return commit, nil
-}
-
-// GetObjectPath returns the path to a commit object.
-func GetObjectPath(repoRoot string, hash string) string {
-	return filepath.Join(repoRoot, ".vec", "objects", hash[:2], hash[2:])
 }
 
 // GetCommitTime returns the commit time as a time.Time object.

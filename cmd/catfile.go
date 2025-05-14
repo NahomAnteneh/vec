@@ -92,7 +92,15 @@ func catFilePrettyPrint(repoRoot, objectHash string) error {
 			return fmt.Errorf("failed to get tree: %w", err)
 		}
 		for _, entry := range tree.Entries {
-			fmt.Printf("%06o %s %s\t%s\n", entry.Mode, entry.Type, entry.Hash, entry.Name)
+			// Display mode in octal format, which is the standard for Git
+			// Use %o for octal representation
+			if entry.Type == "tree" {
+				// For tree entries, always display as 040000
+				fmt.Printf("%06o %s %s\t%s\n", 040000, entry.Type, entry.Hash, entry.Name)
+			} else {
+				// For blob entries, use the mode from the entry
+				fmt.Printf("%06d %s %s\t%s\n", entry.Mode, entry.Type, entry.Hash, entry.Name)
+			}
 		}
 	case "commit":
 		commit, err := objects.GetCommit(repoRoot, objectHash)
@@ -172,11 +180,12 @@ func getObjectType(content []byte) (string, error) {
 
 // printCommit displays a commit object in a human-readable format.
 func printCommit(commit *objects.Commit) {
-	fmt.Printf("tree %s\n", commit.Tree)
+	fmt.Printf("tree:      %s\n", commit.Tree)
 	for _, parent := range commit.Parents {
-		fmt.Printf("parent %s\n", parent)
+		fmt.Printf("parent:    %s\n", parent)
 	}
-	fmt.Printf("author %s %d\n", commit.Author, commit.Timestamp)
+	fmt.Printf("author:    %s %d\n", commit.Author, commit.Timestamp)
+	fmt.Printf("commiter:  %s %d\n", commit.Committer, commit.Timestamp)
 	fmt.Println() // Extra newline before message
 	fmt.Println(commit.Message)
 }
