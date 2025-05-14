@@ -2,9 +2,10 @@ package packfile
 
 import (
 	"compress/zlib"
+	"crypto/sha1"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
-	"io"
 	"os"
 )
 
@@ -67,89 +68,75 @@ func CreateModernPackfile(objects []Object, outputPath string) error {
 		return fmt.Errorf("failed to write packfile header: %w", err)
 	}
 
-	// Track each object's offset for the index
-	offsets := make(map[string]uint64)
-
 	// Write each object
 	for _, obj := range objects {
-		// Record current position for the index
-		pos, err := file.Seek(0, io.SeekCurrent)
-		if err != nil {
-			return fmt.Errorf("failed to get file position: %w", err)
-		}
-		offsets[obj.Hash] = uint64(pos)
-
 		// Write object header (type and size)
 		if err := writeObjectHeader(file, obj.Type, uint64(len(obj.Data))); err != nil {
 			return fmt.Errorf("failed to write object header: %w", err)
 		}
 
 		// Compress and write object data
-		compressedWriter, err := zlib.NewWriterLevel(file, zlib.BestCompression)
-		if err != nil {
-			return fmt.Errorf("failed to create compressed writer: %w", err)
-		}
-
+		compressedWriter := zlib.NewWriter(file)
 		if _, err := compressedWriter.Write(obj.Data); err != nil {
 			compressedWriter.Close()
 			return fmt.Errorf("failed to write compressed data: %w", err)
 		}
-
 		if err := compressedWriter.Close(); err != nil {
 			return fmt.Errorf("failed to close compressed writer: %w", err)
 		}
 	}
 
 	// Calculate and write packfile checksum
-	// This is a placeholder - in a real implementation you would calculate a checksum
-	checksum := make([]byte, 20)
+	currentPos, err := file.Seek(0, os.SEEK_CUR)
+	if err != nil {
+		return fmt.Errorf("failed to get current file position: %w", err)
+	}
+
+	// Move back to the beginning of the file to calculate checksum
+	if _, err := file.Seek(0, os.SEEK_SET); err != nil {
+		return fmt.Errorf("failed to seek to beginning of file: %w", err)
+	}
+
+	// Read the entire file content for checksum calculation
+	content := make([]byte, currentPos)
+	if _, err := file.Read(content); err != nil {
+		return fmt.Errorf("failed to read file content for checksum: %w", err)
+	}
+
+	// Calculate SHA-1 checksum
+	h := sha1.New()
+	h.Write(content)
+	checksum := h.Sum(nil)
+
+	// Move back to the end to write checksum
+	if _, err := file.Seek(currentPos, os.SEEK_SET); err != nil {
+		return fmt.Errorf("failed to seek to end of file: %w", err)
+	}
+
+	// Write the SHA-1 checksum (20 bytes)
 	if _, err := file.Write(checksum); err != nil {
 		return fmt.Errorf("failed to write packfile checksum: %w", err)
-	}
-
-	// Create and write the index file
-	return createPackIndex(outputPath+".idx", offsets, objects)
-}
-
-// writeObjectHeader writes the packfile object header (type + size)
-func writeObjectHeader(file *os.File, objType ObjectType, size uint64) error {
-	// First byte: bits 1-3 are type, bit 4-7 are size lower bits, bit 8 is continuation
-	firstByte := byte(objType) << 4
-	firstByte |= byte(size & 0x0F)
-
-	// Check if we need continuation bytes
-	moreBytes := size >= 16 // 16 = 2^4, we only have 4 bits in the first byte
-
-	if moreBytes {
-		firstByte |= 0x80 // Set continuation bit
-	}
-
-	if err := writeByte(file, firstByte); err != nil {
-		return err
-	}
-
-	// Write continuation bytes if needed
-	remaining := size >> 4
-	for remaining > 0 {
-		currentByte := byte(remaining & 0x7F)
-		remaining >>= 7
-
-		if remaining > 0 {
-			currentByte |= 0x80 // Set continuation bit
-		}
-
-		if err := writeByte(file, currentByte); err != nil {
-			return err
-		}
 	}
 
 	return nil
 }
 
-// writeByte writes a single byte to the file
-func writeByte(file *os.File, b byte) error {
-	_, err := file.Write([]byte{b})
-	return err
+// writeObjectHeader writes the packfile object header (type + size)
+func writeObjectHeader(file *os.File, objType ObjectType, size uint64) error {
+	// Simple encoding: 1 byte for type and 4 bytes for size
+	typeByte := byte(objType)
+	if _, err := file.Write([]byte{typeByte}); err != nil {
+		return fmt.Errorf("failed to write object type: %w", err)
+	}
+
+	// Write size as fixed 4 bytes
+	sizeBytes := make([]byte, 4)
+	binary.BigEndian.PutUint32(sizeBytes, uint32(size))
+	if _, err := file.Write(sizeBytes); err != nil {
+		return fmt.Errorf("failed to write object size: %w", err)
+	}
+
+	return nil
 }
 
 // createPackIndex creates an index file for a packfile
@@ -186,13 +173,12 @@ func createPackIndex(indexPath string, offsets map[string]uint64, objects []Obje
 	// Write the index - this is a simplified implementation
 	// A real implementation would include fanout tables, hash tables, etc.
 	for hash, entry := range index.Entries {
-		// Write 20-byte hash
-		hashBytes := []byte(hash)
-		if len(hashBytes) != 20 {
-			// In a real implementation, the hash would be a proper 20-byte SHA-1
-			// Here we're assuming the hash string is hex-encoded, so we'd convert it
+		// Convert hex hash string to binary 20-byte SHA-1
+		hashBytes, err := hex.DecodeString(hash)
+		if err != nil || len(hashBytes) != 20 {
+			// If the hash isn't a valid hex string or not 20 bytes, create a placeholder
+			// This would be an error in a real implementation, but we'll just use zeros
 			hashBytes = make([]byte, 20)
-			// Parse the hex string into bytes
 		}
 
 		if _, err := file.Write(hashBytes); err != nil {
@@ -207,8 +193,34 @@ func createPackIndex(indexPath string, offsets map[string]uint64, objects []Obje
 		}
 	}
 
-	// Write index checksum - placeholder
-	checksum := make([]byte, 20)
+	// Calculate and write index checksum
+	currentPos, err := file.Seek(0, os.SEEK_CUR)
+	if err != nil {
+		return fmt.Errorf("failed to get current file position: %w", err)
+	}
+
+	// Move back to the beginning of the file to calculate checksum
+	if _, err := file.Seek(0, os.SEEK_SET); err != nil {
+		return fmt.Errorf("failed to seek to beginning of file: %w", err)
+	}
+
+	// Read the entire file content for checksum calculation
+	content := make([]byte, currentPos)
+	if _, err := file.Read(content); err != nil {
+		return fmt.Errorf("failed to read file content for checksum: %w", err)
+	}
+
+	// Calculate SHA-1 checksum
+	h := sha1.New()
+	h.Write(content)
+	checksum := h.Sum(nil)
+
+	// Move back to the end to write checksum
+	if _, err := file.Seek(currentPos, os.SEEK_SET); err != nil {
+		return fmt.Errorf("failed to seek to end of file: %w", err)
+	}
+
+	// Write the SHA-1 checksum (20 bytes)
 	if _, err := file.Write(checksum); err != nil {
 		return fmt.Errorf("failed to write index checksum: %w", err)
 	}

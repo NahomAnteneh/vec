@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"sort"
 )
 
 // applyDelta applies a delta to a base object to produce a new object
@@ -368,57 +369,360 @@ func encodeInsertCommand(buffer *bytes.Buffer, data []byte) {
 
 // OptimizeObjects looks for opportunities to use deltas to reduce object size
 func OptimizeObjects(objects []Object) ([]Object, error) {
-	// This is a simplified implementation
-	// A real implementation would use metrics like similarity, size, and access patterns
+	// Skip optimization if we have too few objects
+	if len(objects) < 2 {
+		return objects, nil
+	}
 
-	// Create a map of objects by type for easier lookup
+	// Group objects by type - only delta against objects of the same type
 	objectsByType := make(map[ObjectType][]Object)
 	for _, obj := range objects {
 		objectsByType[obj.Type] = append(objectsByType[obj.Type], obj)
 	}
 
+	// Resulting optimized object list
 	result := make([]Object, 0, len(objects))
 
-	// Only delta compress objects of the same type
+	// Process each object type separately
 	for _, typeObjects := range objectsByType {
-		// Sort objects by size (descending) to prefer large objects as bases
-		// This is a simple heuristic - real systems use more sophisticated approaches
-		objCount := len(typeObjects)
-
-		// If fewer than 2 objects of this type, no delta compression possible
-		if objCount < 2 {
+		// Skip optimization for this type if too few objects
+		if len(typeObjects) < 2 {
 			result = append(result, typeObjects...)
 			continue
 		}
 
-		// Choose first (largest) object as base and store as is
-		baseObj := typeObjects[0]
-		result = append(result, baseObj)
+		// Create a mapping of object hash to content for easy lookup
+		contentMap := make(map[string][]byte, len(typeObjects))
+		for _, obj := range typeObjects {
+			contentMap[obj.Hash] = obj.Data
+		}
 
-		// Delta compress remaining objects against the base
-		for i := 1; i < objCount; i++ {
-			targetObj := typeObjects[i]
+		// Build similarity matrix for all objects of this type
+		similarities := calculateSimilarities(typeObjects)
 
-			// Create delta
-			delta, err := createDelta(baseObj.Data, targetObj.Data)
-			if err != nil {
-				return nil, fmt.Errorf("failed to create delta: %w", err)
+		// Find optimal delta chains
+		chains := buildDeltaChains(similarities, typeObjects)
+
+		// Apply the delta chains to create delta objects
+		processedHashes := make(map[string]bool)
+		for _, chain := range chains {
+			// Add the base object as-is
+			baseObj := findObjectByHash(typeObjects, chain.BaseHash)
+			if baseObj == nil {
+				// This shouldn't happen in normal operation
+				continue
 			}
 
-			// If delta is smaller than original, use it
-			if len(delta) < len(targetObj.Data) {
-				deltaObj := Object{
-					Hash: targetObj.Hash,
-					Type: OBJ_DELTA,
-					Data: delta,
+			result = append(result, *baseObj)
+			processedHashes[chain.BaseHash] = true
+
+			// Create deltas for all descendants
+			for _, deltaDesc := range chain.Deltas {
+				targetObj := findObjectByHash(typeObjects, deltaDesc.TargetHash)
+				if targetObj == nil || processedHashes[deltaDesc.TargetHash] {
+					continue // Skip if already processed or not found
 				}
-				result = append(result, deltaObj)
-			} else {
-				// Otherwise store the original object
-				result = append(result, targetObj)
+
+				baseData := contentMap[chain.BaseHash]
+				targetData := contentMap[deltaDesc.TargetHash]
+
+				delta, err := createDelta(baseData, targetData)
+				if err != nil {
+					return nil, fmt.Errorf("failed to create delta for %s: %w", deltaDesc.TargetHash, err)
+				}
+
+				// Only use delta if it's smaller than the original
+				if len(delta) < len(targetData) {
+					deltaSavings := len(targetData) - len(delta)
+					if deltaSavings >= minDeltaSavings {
+						deltaObj := Object{
+							Hash: targetObj.Hash,
+							Type: OBJ_DELTA,
+							Data: delta,
+						}
+						result = append(result, deltaObj)
+						processedHashes[deltaDesc.TargetHash] = true
+					} else {
+						// Delta doesn't save enough space, use original
+						result = append(result, *targetObj)
+						processedHashes[deltaDesc.TargetHash] = true
+					}
+				} else {
+					// Delta is larger, use original
+					result = append(result, *targetObj)
+					processedHashes[deltaDesc.TargetHash] = true
+				}
+			}
+		}
+
+		// Add any remaining objects that weren't delta'd
+		for _, obj := range typeObjects {
+			if !processedHashes[obj.Hash] {
+				result = append(result, obj)
 			}
 		}
 	}
 
 	return result, nil
+}
+
+// Constants for delta compression
+const (
+	// Minimum bytes to save to use a delta
+	minDeltaSavings = 512
+
+	// Maximum delta chain length
+	maxChainDepth = 5
+
+	// Chunking size for calculating similarity
+	chunkSize = 64
+)
+
+// DeltaChain represents a chain of delta objects with a base
+type DeltaChain struct {
+	BaseHash string
+	Deltas   []DeltaDescriptor
+}
+
+// DeltaDescriptor describes a delta in a chain
+type DeltaDescriptor struct {
+	TargetHash      string
+	SimilarityScore float64
+}
+
+// ObjectSimilarity stores similarity score between two objects
+type ObjectSimilarity struct {
+	Obj1Hash string
+	Obj2Hash string
+	Score    float64
+}
+
+// findObjectByHash returns the object with the given hash from a slice
+func findObjectByHash(objects []Object, hash string) *Object {
+	for i, obj := range objects {
+		if obj.Hash == hash {
+			return &objects[i]
+		}
+	}
+	return nil
+}
+
+// calculateSimilarities computes similarity scores between all pairs of objects
+func calculateSimilarities(objects []Object) []ObjectSimilarity {
+	result := make([]ObjectSimilarity, 0, len(objects)*(len(objects)-1)/2)
+
+	// Calculate similarity between each pair of objects
+	for i := 0; i < len(objects); i++ {
+		for j := i + 1; j < len(objects); j++ {
+			score := calculateSimilarityScore(objects[i].Data, objects[j].Data)
+
+			result = append(result, ObjectSimilarity{
+				Obj1Hash: objects[i].Hash,
+				Obj2Hash: objects[j].Hash,
+				Score:    score,
+			})
+		}
+	}
+
+	// Sort by similarity score (highest first)
+	sortSimilarities(result)
+
+	return result
+}
+
+// calculateSimilarityScore computes a similarity score between two byte slices
+// Uses a chunking approach to estimate similarity
+func calculateSimilarityScore(data1, data2 []byte) float64 {
+	// If either is empty, no similarity
+	if len(data1) == 0 || len(data2) == 0 {
+		return 0
+	}
+
+	// Get size differential factor (penalty for very different sizes)
+	sizeFactor := float64(min(len(data1), len(data2))) / float64(max(len(data1), len(data2)))
+
+	// Create fingerprints of chunks
+	chunks1 := createChunkFingerprints(data1)
+	chunks2 := createChunkFingerprints(data2)
+
+	// Count matching chunks
+	matchCount := 0
+	for fp1 := range chunks1 {
+		if _, exists := chunks2[fp1]; exists {
+			matchCount++
+		}
+	}
+
+	// Calculate similarity based on matching chunks and size factor
+	chunkSimilarity := 0.0
+	if len(chunks1) > 0 && len(chunks2) > 0 {
+		// Use Jaccard similarity for chunks
+		union := len(chunks1) + len(chunks2) - matchCount
+		chunkSimilarity = float64(matchCount) / float64(union)
+	}
+
+	// Final score combines chunk similarity and size factor
+	return chunkSimilarity * sizeFactor
+}
+
+// createChunkFingerprints divides data into chunks and creates a set of fingerprints
+func createChunkFingerprints(data []byte) map[uint64]struct{} {
+	fingerprints := make(map[uint64]struct{})
+
+	// Simple chunking by fixed size
+	for i := 0; i < len(data)-chunkSize+1; i += chunkSize / 2 { // 50% overlap for better matching
+		end := i + chunkSize
+		if end > len(data) {
+			end = len(data)
+		}
+
+		// Calculate a hash for this chunk
+		fp := simpleHash(data[i:end])
+		fingerprints[fp] = struct{}{}
+	}
+
+	return fingerprints
+}
+
+// simpleHash calculates a simple 64-bit rolling hash of a byte slice
+func simpleHash(data []byte) uint64 {
+	var hash uint64 = 14695981039346656037 // FNV offset basis
+
+	for _, b := range data {
+		hash ^= uint64(b)
+		hash *= 1099511628211 // FNV prime
+	}
+
+	return hash
+}
+
+// sortSimilarities sorts similarity scores in descending order
+func sortSimilarities(similarities []ObjectSimilarity) {
+	// Sort by score in descending order
+	sort.Slice(similarities, func(i, j int) bool {
+		return similarities[i].Score > similarities[j].Score
+	})
+}
+
+// buildDeltaChains constructs optimal delta chains from similarity scores
+func buildDeltaChains(similarities []ObjectSimilarity, objects []Object) []DeltaChain {
+	// Map to track which objects have been assigned to chains
+	assigned := make(map[string]bool)
+
+	// Resulting delta chains
+	chains := make([]DeltaChain, 0)
+
+	// Start with the most similar pairs and build chains
+	for _, sim := range similarities {
+		// Skip if both objects are already in chains
+		if assigned[sim.Obj1Hash] && assigned[sim.Obj2Hash] {
+			continue
+		}
+
+		// If similarity is too low, don't bother delta compressing
+		if sim.Score < 0.3 { // Minimum similarity threshold
+			continue
+		}
+
+		// Choose which object should be the base (prefer larger object)
+		obj1 := findObjectByHash(objects, sim.Obj1Hash)
+		obj2 := findObjectByHash(objects, sim.Obj2Hash)
+
+		if obj1 == nil || obj2 == nil {
+			continue
+		}
+
+		var baseHash, targetHash string
+		if len(obj1.Data) >= len(obj2.Data) {
+			baseHash = obj1.Hash
+			targetHash = obj2.Hash
+		} else {
+			baseHash = obj2.Hash
+			targetHash = obj1.Hash
+		}
+
+		// Check if either object is already a base in an existing chain
+		existingChainIndex := -1
+		for i, chain := range chains {
+			if chain.BaseHash == baseHash || chain.BaseHash == targetHash {
+				existingChainIndex = i
+				break
+			}
+		}
+
+		if existingChainIndex >= 0 {
+			// Add to existing chain if it doesn't create a cycle
+			chain := &chains[existingChainIndex]
+
+			if chain.BaseHash == targetHash {
+				// Need to flip the chain since our target is currently the base
+				// This is complex and would need a complete chain rebuild
+				// For simplicity we'll skip this case
+				continue
+			}
+
+			// Add to the chain if not already in it
+			alreadyInChain := false
+			for _, delta := range chain.Deltas {
+				if delta.TargetHash == targetHash {
+					alreadyInChain = true
+					break
+				}
+			}
+
+			if !alreadyInChain && !assigned[targetHash] {
+				chain.Deltas = append(chain.Deltas, DeltaDescriptor{
+					TargetHash:      targetHash,
+					SimilarityScore: sim.Score,
+				})
+				assigned[targetHash] = true
+			}
+		} else {
+			// Start a new chain
+			if !assigned[baseHash] && !assigned[targetHash] {
+				chain := DeltaChain{
+					BaseHash: baseHash,
+					Deltas: []DeltaDescriptor{
+						{
+							TargetHash:      targetHash,
+							SimilarityScore: sim.Score,
+						},
+					},
+				}
+				chains = append(chains, chain)
+				assigned[baseHash] = true
+				assigned[targetHash] = true
+			}
+		}
+	}
+
+	// Add standalone objects as their own chains
+	for _, obj := range objects {
+		if !assigned[obj.Hash] {
+			chain := DeltaChain{
+				BaseHash: obj.Hash,
+				Deltas:   []DeltaDescriptor{},
+			}
+			chains = append(chains, chain)
+			assigned[obj.Hash] = true
+		}
+	}
+
+	return chains
+}
+
+// min returns the minimum of two integers
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// max returns the maximum of two integers
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }

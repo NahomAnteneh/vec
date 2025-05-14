@@ -5,13 +5,10 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
-	"time"
 
 	"github.com/NahomAnteneh/vec/core"
 	"github.com/NahomAnteneh/vec/internal/objects"
-	"github.com/NahomAnteneh/vec/internal/packfile"
 	"github.com/NahomAnteneh/vec/utils"
 )
 
@@ -19,20 +16,10 @@ import (
 type GarbageCollectOptions struct {
 	// Root path of the repository
 	RepoRoot string
-	// Whether to prune (remove) unreferenced objects rather than packing them
-	Prune bool
-	// Whether to automatically pack objects instead of just removing them
-	AutoPack bool
 	// Whether to run a dry run (don't actually delete anything)
 	DryRun bool
 	// Verbose output
 	Verbose bool
-	// Whether to also pack referenced objects (more aggressive packing)
-	PackAll bool
-	// Whether to repack existing packfiles for better compression
-	Repack bool
-	// Age threshold for considering objects as old (in days)
-	OldObjectThreshold int
 }
 
 // GCStats contains statistics from the garbage collection operation
@@ -41,14 +28,6 @@ type GCStats struct {
 	ObjectsExamined int
 	// Number of objects removed
 	ObjectsRemoved int
-	// Number of objects packed
-	ObjectsPacked int
-	// Number of packfiles pruned
-	PackfilesPruned int
-	// Number of packfiles repacked
-	PackfilesRepacked int
-	// Number of referenced objects packed
-	ReferencedObjectsPacked int
 	// Space saved in bytes
 	SpaceSaved int64
 }
@@ -56,17 +35,12 @@ type GCStats struct {
 // DefaultGCOptions returns default garbage collection options
 func DefaultGCOptions() GarbageCollectOptions {
 	return GarbageCollectOptions{
-		Prune:              false,
-		AutoPack:           true,
-		DryRun:             false,
-		Verbose:            false,
-		PackAll:            false,
-		Repack:             false,
-		OldObjectThreshold: 14, // Default to 14 days
+		DryRun:  false,
+		Verbose: false,
 	}
 }
 
-// GarbageCollect performs garbage collection on the repository (legacy function)
+// GarbageCollect performs garbage collection on the repository
 func GarbageCollect(options GarbageCollectOptions) (*GCStats, error) {
 	// Get repository root if not specified
 	repoRoot := options.RepoRoot
@@ -102,13 +76,10 @@ func GarbageCollectRepo(repo *core.Repository, options GarbageCollectOptions) (*
 
 	// Identify unreferenced objects
 	unreferenced := []ObjectInfo{}
-	referenced := []ObjectInfo{}
 
 	for _, obj := range allObjects {
 		if !reachable[obj.Hash] {
 			unreferenced = append(unreferenced, obj)
-		} else {
-			referenced = append(referenced, obj)
 		}
 	}
 
@@ -128,106 +99,21 @@ func GarbageCollectRepo(repo *core.Repository, options GarbageCollectOptions) (*
 		if options.Verbose {
 			fmt.Println("Dry run - no changes will be made")
 			for _, obj := range unreferenced {
-				action := "remove"
-				if options.AutoPack && !options.Prune {
-					action = "pack"
-				}
-				fmt.Printf("Would %s object: %s (%d bytes)\n", action, obj.Hash, obj.Size)
-			}
-
-			if options.PackAll {
-				fmt.Printf("Would also pack %d referenced objects\n", len(referenced))
-			}
-
-			if options.Repack {
-				packfiles, _ := findPackfilesRepo(repo)
-				fmt.Printf("Would repack %d existing packfiles\n", len(packfiles))
+				fmt.Printf("Would remove object: %s (%d bytes)\n", obj.Hash, obj.Size)
 			}
 		}
 		stats.ObjectsRemoved = len(unreferenced)
 		stats.SpaceSaved = totalSize
-		if options.PackAll {
-			stats.ReferencedObjectsPacked = len(referenced)
-		}
 		return stats, nil
 	}
 
-	// Handle unreferenced objects
+	// Remove unreferenced objects
 	if len(unreferenced) > 0 {
-		if options.Prune {
-			// Remove unreferenced objects
-			if err := removeUnreferencedObjectsRepo(repo, unreferenced, options.Verbose); err != nil {
-				return stats, fmt.Errorf("failed to remove unreferenced objects: %w", err)
-			}
-			stats.ObjectsRemoved = len(unreferenced)
-			stats.SpaceSaved = totalSize
-		} else if options.AutoPack {
-			// Extract just the hash strings from ObjectInfo for packing
-			hashes := make([]string, len(unreferenced))
-			for i, obj := range unreferenced {
-				hashes[i] = obj.Hash
-			}
-
-			// Pack unreferenced objects
-			if err := packUnreferencedObjectsRepo(repo, hashes, options.DryRun, options.Verbose); err != nil {
-				return stats, fmt.Errorf("failed to pack unreferenced objects: %w", err)
-			}
-			stats.ObjectsPacked = len(unreferenced)
-			// Estimate space saved - typically packing saves about 30-50% of space
-			stats.SpaceSaved = totalSize / 2
+		if err := removeUnreferencedObjectsRepo(repo, unreferenced, options.Verbose); err != nil {
+			return stats, fmt.Errorf("failed to remove unreferenced objects: %w", err)
 		}
-	}
-
-	// Pack referenced objects if requested
-	if options.PackAll && len(referenced) > 0 {
-		if options.Verbose {
-			fmt.Printf("Packing %d referenced objects...\n", len(referenced))
-		}
-
-		// Determine which referenced objects to pack (older than threshold)
-		var referencedHashes []string
-		var referencedSize int64
-
-		// If OldObjectThreshold is set, only pack objects older than the threshold
-		cutoffTime := time.Now().AddDate(0, 0, -options.OldObjectThreshold)
-
-		for _, obj := range referenced {
-			objInfo, err := os.Stat(obj.Path)
-			if err != nil {
-				continue // Skip objects we can't stat
-			}
-
-			// Only pack objects older than the threshold
-			if objInfo.ModTime().Before(cutoffTime) {
-				referencedHashes = append(referencedHashes, obj.Hash)
-				referencedSize += obj.Size
-			}
-		}
-
-		if len(referencedHashes) > 0 {
-			if err := packReferencedObjectsRepo(repo, referencedHashes, options.Verbose); err != nil {
-				return stats, fmt.Errorf("failed to pack referenced objects: %w", err)
-			}
-			stats.ReferencedObjectsPacked = len(referencedHashes)
-			// Estimate space saved from packing referenced objects
-			stats.SpaceSaved += referencedSize / 3 // Less space savings for referenced objects due to duplication
-		}
-	}
-
-	// Repack existing packfiles if requested
-	if options.Repack {
-		packfiles, err := findPackfilesRepo(repo)
-		if err != nil {
-			return stats, fmt.Errorf("failed to find packfiles: %w", err)
-		}
-
-		if len(packfiles) > 0 {
-			repacked, err := repackExistingPackfilesRepo(repo, packfiles, options.Verbose)
-			if err != nil {
-				return stats, fmt.Errorf("failed to repack packfiles: %w", err)
-			}
-			stats.PackfilesRepacked = repacked
-		}
+		stats.ObjectsRemoved = len(unreferenced)
+		stats.SpaceSaved = totalSize
 	}
 
 	return stats, nil
@@ -238,12 +124,6 @@ type ObjectInfo struct {
 	Hash string
 	Path string
 	Size int64
-}
-
-// findReachableObjects finds all objects that are reachable from refs (legacy function)
-func findReachableObjects(repoPath string) (map[string]bool, error) {
-	repo := core.NewRepository(repoPath)
-	return findReachableObjectsRepo(repo)
 }
 
 // findReachableObjectsRepo finds all objects that are reachable from refs using Repository context
@@ -310,13 +190,7 @@ func findReachableObjectsRepo(repo *core.Repository) (map[string]bool, error) {
 	return reachable, nil
 }
 
-// markReachableFromObject recursively marks an object and its referenced objects as reachable (legacy function)
-func markReachableFromObject(repoPath, hash string, reachable map[string]bool) error {
-	repo := core.NewRepository(repoPath)
-	return markReachableFromObjectRepo(repo, hash, reachable)
-}
-
-// markReachableFromObjectRepo recursively marks an object and its referenced objects as reachable using Repository context
+// markReachableFromObjectRepo recursively marks an object and its referenced objects as reachable
 func markReachableFromObjectRepo(repo *core.Repository, hash string, reachable map[string]bool) error {
 	if hash == "" || len(hash) < 4 {
 		return nil // Skip invalid hashes
@@ -389,22 +263,12 @@ func markReachableFromObjectRepo(repo *core.Repository, hash string, reachable m
 		if err := markReachableFromTreeRepo(repo, hash, reachable); err != nil {
 			return err
 		}
-
-	case "tag":
-		// For simplicity, we're skipping annotated tags in this example
-		// In a real implementation, we would parse the tag and mark its target
 	}
 
 	return nil
 }
 
-// markReachableFromTree marks all objects referenced by a tree as reachable (legacy function)
-func markReachableFromTree(repoPath, treeHash string, reachable map[string]bool) error {
-	repo := core.NewRepository(repoPath)
-	return markReachableFromTreeRepo(repo, treeHash, reachable)
-}
-
-// markReachableFromTreeRepo marks all objects referenced by a tree as reachable using Repository context
+// markReachableFromTreeRepo marks all objects referenced by a tree as reachable
 func markReachableFromTreeRepo(repo *core.Repository, treeHash string, reachable map[string]bool) error {
 	tree, err := objects.GetTree(repo.Root, treeHash)
 	if err != nil {
@@ -429,13 +293,7 @@ func markReachableFromTreeRepo(repo *core.Repository, treeHash string, reachable
 	return nil
 }
 
-// findAllObjects finds all objects in the repository (legacy function)
-func findAllObjects(repoPath string) ([]ObjectInfo, error) {
-	repo := core.NewRepository(repoPath)
-	return findAllObjectsRepo(repo)
-}
-
-// findAllObjectsRepo finds all objects in the repository using Repository context
+// findAllObjectsRepo finds all objects in the repository
 func findAllObjectsRepo(repo *core.Repository) ([]ObjectInfo, error) {
 	objectsDir := filepath.Join(repo.VecDir, "objects")
 	if !dirExists(objectsDir) {
@@ -496,13 +354,7 @@ func findAllObjectsRepo(repo *core.Repository) ([]ObjectInfo, error) {
 	return objects, nil
 }
 
-// removeUnreferencedObjects deletes unreferenced objects from the repository
-func removeUnreferencedObjects(repoPath string, unreferenced []ObjectInfo, verbose bool) error {
-	repo := core.NewRepository(repoPath)
-	return removeUnreferencedObjectsRepo(repo, unreferenced, verbose)
-}
-
-// removeUnreferencedObjectsRepo removes unreferenced objects from the repository using Repository context
+// removeUnreferencedObjectsRepo removes unreferenced objects from the repository
 func removeUnreferencedObjectsRepo(repo *core.Repository, unreferenced []ObjectInfo, verbose bool) error {
 	for _, obj := range unreferenced {
 		if verbose {
@@ -512,250 +364,13 @@ func removeUnreferencedObjectsRepo(repo *core.Repository, unreferenced []ObjectI
 		if err := os.Remove(obj.Path); err != nil {
 			return fmt.Errorf("failed to remove object %s: %w", obj.Hash, err)
 		}
+
+		// Try to remove empty directory
+		dirPath := filepath.Join(repo.VecDir, "objects", obj.Hash[:2])
+		removeEmptyDir(dirPath)
 	}
 
 	return nil
-}
-
-// packUnreferencedObjects packs unreferenced objects into a packfile and removes the originals (legacy function)
-func packUnreferencedObjects(repoPath string, hashes []string, dryRun, verbose bool) error {
-	repo := core.NewRepository(repoPath)
-	return packUnreferencedObjectsRepo(repo, hashes, dryRun, verbose)
-}
-
-// packUnreferencedObjectsRepo packs unreferenced objects into a packfile and removes the originals using Repository context
-func packUnreferencedObjectsRepo(repo *core.Repository, hashes []string, dryRun, verbose bool) error {
-	if len(hashes) == 0 {
-		return nil
-	}
-
-	if verbose {
-		fmt.Printf("Packing %d unreferenced objects...\n", len(hashes))
-	}
-
-	if dryRun {
-		return nil
-	}
-
-	// Ensure pack directory exists
-	packDir := filepath.Join(repo.VecDir, "objects", "pack")
-	if err := os.MkdirAll(packDir, 0755); err != nil {
-		return fmt.Errorf("failed to create pack directory: %w", err)
-	}
-
-	// Create a timestamp-based filename for the packfile
-	timestamp := time.Now().Format("20060102150405")
-	packfilePath := filepath.Join(packDir, fmt.Sprintf("unref-%s.pack", timestamp))
-
-	// Create packfile from hashes
-	if err := packfile.CreatePackfileFromHashesRepo(repo, hashes, packfilePath, true); err != nil {
-		return fmt.Errorf("failed to create packfile: %w", err)
-	}
-
-	// Check if objects were actually packed before removing them
-	if fileExists(packfilePath) && fileExists(packfilePath+".idx") {
-		// Remove original objects
-		for _, hash := range hashes {
-			prefix := hash[:2]
-			suffix := hash[2:]
-			objectPath := filepath.Join(repo.VecDir, "objects", prefix, suffix)
-
-			if err := os.Remove(objectPath); err != nil {
-				if !os.IsNotExist(err) {
-					// Log error but continue with other objects
-					fmt.Fprintf(os.Stderr, "Warning: failed to remove object %s: %v\n", hash, err)
-				}
-			}
-
-			// Try to remove empty directories
-			dirPath := filepath.Join(repo.VecDir, "objects", prefix)
-			removeEmptyDir(dirPath)
-		}
-	}
-
-	return nil
-}
-
-// findPackfiles finds all packfiles in the repository (legacy function)
-func findPackfiles(repoPath string) ([]string, error) {
-	repo := core.NewRepository(repoPath)
-	return findPackfilesRepo(repo)
-}
-
-// findPackfilesRepo finds all packfiles in the repository using Repository context
-func findPackfilesRepo(repo *core.Repository) ([]string, error) {
-	packDir := filepath.Join(repo.VecDir, "objects", "pack")
-	if !fileExists(packDir) {
-		return []string{}, nil
-	}
-
-	entries, err := os.ReadDir(packDir)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read pack directory: %w", err)
-	}
-
-	var packfiles []string
-	for _, entry := range entries {
-		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".pack") {
-			packfiles = append(packfiles, filepath.Join(packDir, entry.Name()))
-		}
-	}
-
-	return packfiles, nil
-}
-
-// packGroup represents a packfile and its associated index file
-type packGroup struct {
-	packfile string
-	index    string
-	modTime  time.Time
-}
-
-// pruneOldPackfiles removes packfiles older than the specified age in days
-func pruneOldPackfiles(repoPath string, maxAgeDays int, dryRun, verbose bool) error {
-	packDir := filepath.Join(repoPath, ".vec", "objects", "pack")
-	if !utils.FileExists(packDir) {
-		return nil // No pack directory
-	}
-
-	entries, err := os.ReadDir(packDir)
-	if err != nil {
-		return fmt.Errorf("failed to read pack directory: %w", err)
-	}
-
-	// Group packfiles with their indices
-	packGroups := make(map[string]*packGroup)
-
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-
-		name := entry.Name()
-		if !strings.HasSuffix(name, ".pack") && !strings.HasSuffix(name, ".idx") {
-			continue
-		}
-
-		info, err := entry.Info()
-		if err != nil {
-			continue
-		}
-
-		// Extract the base name (without extension)
-		baseName := strings.TrimSuffix(strings.TrimSuffix(name, ".pack"), ".idx")
-
-		group, exists := packGroups[baseName]
-		if !exists {
-			group = &packGroup{modTime: info.ModTime()}
-			packGroups[baseName] = group
-		}
-
-		if strings.HasSuffix(name, ".pack") {
-			group.packfile = name
-		} else if strings.HasSuffix(name, ".idx") {
-			group.index = name
-		}
-	}
-
-	// Sort groups by modification time
-	var groups []*packGroup
-	for _, group := range packGroups {
-		// Only include complete groups (both .pack and .idx)
-		if group.packfile != "" && group.index != "" {
-			groups = append(groups, group)
-		}
-	}
-
-	// Sort by modification time (oldest first)
-	sort.Slice(groups, func(i, j int) bool {
-		return groups[i].modTime.Before(groups[j].modTime)
-	})
-
-	// Keep at least one packfile
-	if len(groups) <= 1 {
-		return nil
-	}
-
-	// Calculate cutoff time
-	cutoff := time.Now().AddDate(0, 0, -maxAgeDays)
-
-	// Remove old packfiles
-	for _, group := range groups[:len(groups)-1] { // Keep the newest one
-		if group.modTime.After(cutoff) {
-			continue // Skip packfiles newer than the cutoff
-		}
-
-		if verbose {
-			fmt.Printf("Pruning old packfile: %s (modified %s)\n", group.packfile, group.modTime)
-		}
-
-		if !dryRun {
-			// Delete the packfile and its index
-			packPath := filepath.Join(packDir, group.packfile)
-			indexPath := filepath.Join(packDir, group.index)
-			if err := os.Remove(packPath); err != nil {
-				return err
-			}
-			if err := os.Remove(indexPath); err != nil {
-				return err
-			}
-		}
-	}
-
-	return nil
-}
-
-// packReferencedObjects packs referenced objects into a packfile (legacy function)
-func packReferencedObjects(repoPath string, hashes []string, verbose bool) error {
-	repo := core.NewRepository(repoPath)
-	return packReferencedObjectsRepo(repo, hashes, verbose)
-}
-
-// packReferencedObjectsRepo packs referenced objects into a packfile using Repository context
-func packReferencedObjectsRepo(repo *core.Repository, hashes []string, verbose bool) error {
-	if len(hashes) == 0 {
-		return nil
-	}
-
-	if verbose {
-		fmt.Printf("Packing %d referenced objects...\n", len(hashes))
-	}
-
-	// Ensure pack directory exists
-	packDir := filepath.Join(repo.VecDir, "objects", "pack")
-	if err := os.MkdirAll(packDir, 0755); err != nil {
-		return fmt.Errorf("failed to create pack directory: %w", err)
-	}
-
-	// Create a timestamp-based filename for the packfile
-	timestamp := time.Now().Format("20060102150405")
-	packfilePath := filepath.Join(packDir, fmt.Sprintf("refs-%s.pack", timestamp))
-
-	// Create packfile from hashes (we don't remove the originals for referenced objects)
-	if err := packfile.CreatePackfileFromHashesRepo(repo, hashes, packfilePath, true); err != nil {
-		return fmt.Errorf("failed to create packfile: %w", err)
-	}
-
-	return nil
-}
-
-// repackExistingPackfiles repacks existing packfiles for better compression (legacy function)
-func repackExistingPackfiles(repoPath string, packfiles []string, verbose bool) (int, error) {
-	repo := core.NewRepository(repoPath)
-	return repackExistingPackfilesRepo(repo, packfiles, verbose)
-}
-
-// repackExistingPackfilesRepo repacks existing packfiles for better compression using Repository context
-func repackExistingPackfilesRepo(repo *core.Repository, packfiles []string, verbose bool) (int, error) {
-	// Implementation of repacking logic
-	// This is a placeholder - in a real implementation, you'd extract objects from packfiles,
-	// optimize them with delta compression, and create new packfiles
-
-	if verbose {
-		fmt.Printf("Repacking %d packfiles...\n", len(packfiles))
-	}
-
-	return len(packfiles), nil
 }
 
 // fileExists returns true if the path exists and is a file

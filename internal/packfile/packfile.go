@@ -14,9 +14,17 @@ import (
 
 // FinalizePackfile prepares a packfile for transmission by adding checksums and other metadata
 func FinalizePackfile(packfile []byte) []byte {
-	// This is just a placeholder function that would add any final processing to the packfile
-	// In a real implementation, you might add checksums, verify content, etc.
-	return packfile
+	// Calculate the SHA-1 checksum of the packfile content
+	h := sha1.New()
+	h.Write(packfile)
+	checksum := h.Sum(nil)
+
+	// Append the checksum to the packfile
+	finalizedPackfile := make([]byte, len(packfile)+len(checksum))
+	copy(finalizedPackfile, packfile)
+	copy(finalizedPackfile[len(packfile):], checksum)
+
+	return finalizedPackfile
 }
 
 // CalculatePackfileChecksum calculates a checksum for the packfile
