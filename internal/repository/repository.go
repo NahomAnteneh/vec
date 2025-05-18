@@ -9,11 +9,41 @@ import (
 	"github.com/NahomAnteneh/vec/utils"
 )
 
-// // CreateRepository initializes a new Vec repository at the specified directory (legacy function)
-// func CreateRepository(dir string) error {
-// 	repo := core.NewRepository(dir)
-// 	return CreateRepo(repo)
-// }
+// createCommonDirectories creates the standard directory structure for a Vec repository
+func createCommonDirectories(baseDir string) error {
+	// Create subdirectories
+	subDirs := []string{
+		filepath.Join(baseDir, "objects"),
+		filepath.Join(baseDir, "objects", "pack"),
+		filepath.Join(baseDir, "objects", "info"),
+		filepath.Join(baseDir, "refs", "heads"),
+		filepath.Join(baseDir, "refs", "remotes"),
+		filepath.Join(baseDir, "logs", "refs", "heads"),
+		filepath.Join(baseDir, "logs"),
+	}
+	
+	for _, subDir := range subDirs {
+		if err := os.MkdirAll(subDir, 0755); err != nil {
+			return fmt.Errorf("failed to create subdirectory %s: %w", subDir, err)
+		}
+	}
+	
+	// Create common files
+	files := map[string]string{
+		filepath.Join(baseDir, "objects", "info", "packs"):      "",
+		filepath.Join(baseDir, "objects", "info", "alternates"): "",
+		filepath.Join(baseDir, "HEAD"):                          "ref: refs/heads/main\n",
+		filepath.Join(baseDir, "logs", "HEAD"):                  "",
+	}
+	
+	for file, content := range files {
+		if err := os.WriteFile(file, []byte(content), 0644); err != nil {
+			return fmt.Errorf("failed to create file %s: %w", file, err)
+		}
+	}
+	
+	return nil
+}
 
 // CreateRepo initializes a new Vec repository using Repository context
 func CreateRepo(repo *core.Repository) error {
@@ -29,55 +59,14 @@ func CreateRepo(repo *core.Repository) error {
 		return fmt.Errorf("failed to create .vec directory: %w", err)
 	}
 
-	// Create subdirectories.
-	subDirs := []string{
-		filepath.Join(vecDir, "objects"),
-		filepath.Join(vecDir, "objects", "pack"),
-		filepath.Join(vecDir, "objects", "info"),
-		filepath.Join(vecDir, "refs", "heads"),
-		filepath.Join(vecDir, "refs", "remotes"),
-		filepath.Join(vecDir, "logs", "refs", "heads"),
-		filepath.Join(vecDir, "logs"),
-	}
-	for _, subDir := range subDirs {
-		if err := os.MkdirAll(subDir, 0755); err != nil {
-			return fmt.Errorf("failed to create subdirectory %s: %w", subDir, err)
-		}
-	}
-
-	// Create an empty packfile index to initialize proper structure
-	packInfoFile := filepath.Join(vecDir, "objects", "info", "packs")
-	if err := os.WriteFile(packInfoFile, []byte(""), 0644); err != nil {
-		return fmt.Errorf("failed to create packfile info file: %w", err)
-	}
-
-	// Create an empty alternates file for potential alternate object stores
-	alternatesFile := filepath.Join(vecDir, "objects", "info", "alternates")
-	if err := os.WriteFile(alternatesFile, []byte(""), 0644); err != nil {
-		return fmt.Errorf("failed to create alternates file: %w", err)
-	}
-
-	// Create HEAD file.
-	headFile := filepath.Join(vecDir, "HEAD")
-	if err := os.WriteFile(headFile, []byte("ref: refs/heads/main\n"), 0644); err != nil {
-		return fmt.Errorf("failed to create HEAD file: %w", err)
-	}
-
-	// Create logs/HEAD file
-	logHeadFile := filepath.Join(vecDir, "logs", "HEAD")
-	if err := os.WriteFile(logHeadFile, []byte(""), 0644); err != nil { // Initialize as empty
-		return fmt.Errorf("failed to create logs/HEAD file: %w", err)
+	// Create common directory structure
+	if err := createCommonDirectories(vecDir); err != nil {
+		return err
 	}
 
 	fmt.Printf("Initialized empty Vec repository in %s\n", vecDir)
 	return nil
 }
-
-// CreateRepositoryBare creates a bare repository at the specified directory (legacy function)
-// func CreateRepositoryBare(dir string) error {
-// 	repo := core.NewRepository(dir)
-// 	return CreateBareRepo(repo)
-// }
 
 // CreateBareRepo creates a bare repository using Repository context
 func CreateBareRepo(repo *core.Repository) error {
@@ -101,44 +90,9 @@ func CreateBareRepo(repo *core.Repository) error {
 		}
 	}
 
-	// Create subdirectories directly in the specified directory
-	subDirs := []string{
-		filepath.Join(dir, "objects"),
-		filepath.Join(dir, "objects", "pack"),
-		filepath.Join(dir, "objects", "info"),
-		filepath.Join(dir, "refs", "heads"),
-		filepath.Join(dir, "refs", "remotes"),
-		filepath.Join(dir, "logs", "refs", "heads"),
-		filepath.Join(dir, "logs"),
-	}
-	for _, subDir := range subDirs {
-		if err := os.MkdirAll(subDir, 0755); err != nil {
-			return fmt.Errorf("failed to create subdirectory %s: %w", subDir, err)
-		}
-	}
-
-	// Create an empty packfile index to initialize proper structure
-	packInfoFile := filepath.Join(dir, "objects", "info", "packs")
-	if err := os.WriteFile(packInfoFile, []byte(""), 0644); err != nil {
-		return fmt.Errorf("failed to create packfile info file: %w", err)
-	}
-
-	// Create an empty alternates file for potential alternate object stores
-	alternatesFile := filepath.Join(dir, "objects", "info", "alternates")
-	if err := os.WriteFile(alternatesFile, []byte(""), 0644); err != nil {
-		return fmt.Errorf("failed to create alternates file: %w", err)
-	}
-
-	// Create HEAD file
-	headFile := filepath.Join(dir, "HEAD")
-	if err := os.WriteFile(headFile, []byte("ref: refs/heads/main\n"), 0644); err != nil {
-		return fmt.Errorf("failed to create HEAD file: %w", err)
-	}
-
-	// Create logs/HEAD file
-	logHeadFile := filepath.Join(dir, "logs", "HEAD")
-	if err := os.WriteFile(logHeadFile, []byte(""), 0644); err != nil { // Initialize as empty
-		return fmt.Errorf("failed to create logs/HEAD file: %w", err)
+	// Create common directory structure
+	if err := createCommonDirectories(dir); err != nil {
+		return err
 	}
 
 	// Create a config file with bare=true

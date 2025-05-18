@@ -11,14 +11,10 @@ import (
 	"github.com/NahomAnteneh/vec/internal/staging"
 )
 
-// performMerge executes a three-way merge between base, ours, and theirs trees (legacy function).
-func performMerge(repoRoot string, index *staging.Index, baseTree, ourTree, theirTree *objects.TreeObject, config *MergeConfig) (MergeResult, error) {
-	repo := core.NewRepository(repoRoot)
-	return performMergeRepo(repo, index, baseTree, ourTree, theirTree, config)
-}
 
-// performMergeRepo executes a three-way merge between base, ours, and theirs trees using Repository context.
-func performMergeRepo(repo *core.Repository, index *staging.Index, baseTree, ourTree, theirTree *objects.TreeObject, config *MergeConfig) (MergeResult, error) {
+
+// performMerge executes a three-way merge between base, ours, and theirs trees using Repository context.
+func performMerge(repo *core.Repository, index *staging.Index, baseTree, ourTree, theirTree *objects.TreeObject, config *MergeConfig) (MergeResult, error) {
 	var result MergeResult
 	mergeResults := make(map[string]MergeResult)
 
@@ -214,14 +210,10 @@ func applyChangesToWorkingDirectory(repoRoot string, mergeResults map[string]Mer
 	return nil
 }
 
-// CheckoutCommit updates the working directory and index (legacy function).
-func CheckoutCommit(repoRoot, commitID string) error {
-	repo := core.NewRepository(repoRoot)
-	return CheckoutCommitRepo(repo, commitID)
-}
 
-// CheckoutCommitRepo updates the working directory and index to match a commit using Repository context.
-func CheckoutCommitRepo(repo *core.Repository, commitID string) error {
+
+// CheckoutCommit updates the working directory and index to match a commit using Repository context.
+func CheckoutCommit(repo *core.Repository, commitID string) error {
 	commit, err := objects.GetCommit(repo.Root, commitID)
 	if err != nil {
 		return fmt.Errorf("failed to load commit %s: %w", commitID, err)
@@ -230,10 +222,10 @@ func CheckoutCommitRepo(repo *core.Repository, commitID string) error {
 	if err != nil {
 		return fmt.Errorf("failed to load tree %s: %w", commit.Tree, err)
 	}
-	if err := updateWorkingDirectory(repo.Root, tree, ""); err != nil {
+	if err := updateWorkingDirectory(repo, tree, ""); err != nil {
 		return fmt.Errorf("failed to update working directory: %w", err)
 	}
-	index, err := createIndexFromTree(repo.Root, tree, "")
+	index, err := createIndexFromTree(repo, tree, "")
 	if err != nil {
 		return fmt.Errorf("failed to create index from tree: %w", err)
 	}
@@ -253,13 +245,13 @@ func CheckoutCommitRepo(repo *core.Repository, commitID string) error {
 	return nil
 }
 
-// updateWorkingDirectory updates the working directory to match the tree.
-func updateWorkingDirectory(repoRoot string, tree *objects.TreeObject, basePath string) error {
+// updateWorkingDirectory updates the working directory to match the tree using Repository context.
+func updateWorkingDirectory(repo *core.Repository, tree *objects.TreeObject, basePath string) error {
 	for _, entry := range tree.Entries {
 		currentPath := filepath.Join(basePath, entry.Name)
-		absPath := filepath.Join(repoRoot, currentPath)
+		absPath := filepath.Join(repo.Root, currentPath)
 		if entry.Type == "blob" {
-			content, err := objects.GetBlob(repoRoot, entry.Hash)
+			content, err := objects.GetBlob(repo.Root, entry.Hash)
 			if err != nil {
 				return fmt.Errorf("failed to get blob '%s': %w", entry.Hash, err)
 			}
@@ -270,11 +262,11 @@ func updateWorkingDirectory(repoRoot string, tree *objects.TreeObject, basePath 
 				return fmt.Errorf("failed to write file '%s': %w", currentPath, err)
 			}
 		} else if entry.Type == "tree" {
-			subTree, err := objects.GetTree(repoRoot, entry.Hash)
+			subTree, err := objects.GetTree(repo.Root, entry.Hash)
 			if err != nil {
 				return fmt.Errorf("failed to get subtree '%s': %w", entry.Hash, err)
 			}
-			if err := updateWorkingDirectory(repoRoot, subTree, currentPath); err != nil {
+			if err := updateWorkingDirectory(repo, subTree, currentPath); err != nil {
 				return err
 			}
 		}
@@ -282,13 +274,15 @@ func updateWorkingDirectory(repoRoot string, tree *objects.TreeObject, basePath 
 	return nil
 }
 
-// createIndexFromTree creates an index from a tree.
-func createIndexFromTree(repoRoot string, tree *objects.TreeObject, basePath string) (*staging.Index, error) {
-	index := staging.NewIndex(repoRoot)
+
+
+// createIndexFromTree creates an index from a tree using Repository context.
+func createIndexFromTree(repo *core.Repository, tree *objects.TreeObject, basePath string) (*staging.Index, error) {
+	index := staging.NewIndex(repo)
 	for _, entry := range tree.Entries {
 		currentPath := filepath.Join(basePath, entry.Name)
 		if entry.Type == "blob" {
-			absPath := filepath.Join(repoRoot, currentPath)
+			absPath := filepath.Join(repo.Root, currentPath)
 			stat, err := os.Stat(absPath)
 			if err != nil {
 				return nil, fmt.Errorf("failed to stat '%s': %w", currentPath, err)
@@ -303,11 +297,11 @@ func createIndexFromTree(repoRoot string, tree *objects.TreeObject, basePath str
 			}
 			index.Entries = append(index.Entries, indexEntry)
 		} else if entry.Type == "tree" {
-			subTree, err := objects.GetTree(repoRoot, entry.Hash)
+			subTree, err := objects.GetTree(repo.Root, entry.Hash)
 			if err != nil {
 				return nil, fmt.Errorf("failed to get subtree '%s': %w", entry.Hash, err)
 			}
-			subIndex, err := createIndexFromTree(repoRoot, subTree, currentPath)
+			subIndex, err := createIndexFromTree(repo, subTree, currentPath)
 			if err != nil {
 				return nil, err
 			}
@@ -316,3 +310,5 @@ func createIndexFromTree(repoRoot string, tree *objects.TreeObject, basePath str
 	}
 	return index, nil
 }
+
+

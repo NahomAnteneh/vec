@@ -40,33 +40,19 @@ type IndexEntry struct {
 	TheirSHA string    // SHA of their version (for conflicts)
 }
 
-// NewIndex creates a new, empty Index (legacy function).
-func NewIndex(repoRoot string) *Index {
-	return &Index{
-		Entries: []IndexEntry{},
-		Path:    filepath.Join(repoRoot, ".vec", "index"),
-	}
-}
-
-// NewIndexRepo creates a new, empty Index using Repository context.
-func NewIndexRepo(repo *core.Repository) *Index {
+// NewIndex creates a new, empty Index using Repository context.
+func NewIndex(repo *core.Repository) *Index {
 	return &Index{
 		Entries: []IndexEntry{},
 		Path:    filepath.Join(repo.VecDir, "index"),
 	}
 }
 
-// LoadIndex reads the index from disk or returns a new one if it doesn't exist (legacy function).
-func LoadIndex(repoRoot string) (*Index, error) {
-	repo := core.NewRepository(repoRoot)
-	return LoadIndexRepo(repo)
-}
-
-// LoadIndexRepo reads the index from disk or returns a new one if it doesn't exist using Repository context.
-func LoadIndexRepo(repo *core.Repository) (*Index, error) {
+// LoadIndex reads the index from disk or returns a new one if it doesn't exist using Repository context.
+func LoadIndex(repo *core.Repository) (*Index, error) {
 	indexPath := filepath.Join(repo.VecDir, "index")
 	if !utils.FileExists(indexPath) {
-		return NewIndexRepo(repo), nil
+		return NewIndex(repo), nil
 	}
 
 	data, err := os.ReadFile(indexPath)
@@ -74,7 +60,7 @@ func LoadIndexRepo(repo *core.Repository) (*Index, error) {
 		return nil, fmt.Errorf("failed to read index file: %w", err)
 	}
 
-	return DeserializeIndexRepo(repo, data)
+	return DeserializeIndex(repo, data)
 }
 
 // Write serializes and writes the index to disk.
@@ -89,14 +75,8 @@ func (i *Index) Write() error {
 	return nil
 }
 
-// Add adds or updates a stage 0 entry in the index for a file (legacy function).
-func (i *Index) Add(repoRoot, relPath, hash string) error {
-	repo := core.NewRepository(repoRoot)
-	return i.AddRepo(repo, relPath, hash)
-}
-
-// AddRepo adds or updates a stage 0 entry in the index for a file using Repository context.
-func (i *Index) AddRepo(repo *core.Repository, relPath, hash string) error {
+// Add adds or updates a stage 0 entry in the index for a file using Repository context.
+func (i *Index) Add(repo *core.Repository, relPath, hash string) error {
 	absPath := filepath.Join(repo.Root, relPath)
 	fileInfo, err := os.Stat(absPath)
 	if err != nil {
@@ -131,14 +111,8 @@ func (i *Index) AddRepo(repo *core.Repository, relPath, hash string) error {
 	return nil
 }
 
-// Remove removes a stage 0 entry from the index (legacy function).
-func (i *Index) Remove(repoRoot, relPath string) error {
-	repo := core.NewRepository(repoRoot)
-	return i.RemoveRepo(repo, relPath)
-}
-
-// RemoveRepo removes a stage 0 entry from the index using Repository context.
-func (i *Index) RemoveRepo(repo *core.Repository, relPath string) error {
+// Remove removes a stage 0 entry from the index using Repository context.
+func (i *Index) Remove(repo *core.Repository, relPath string) error {
 	for j, entry := range i.Entries {
 		if entry.FilePath == relPath && entry.Stage == 0 {
 			i.Entries = slices.Delete(i.Entries, j, j+1)
@@ -174,19 +148,19 @@ func (i *Index) GetStagedFiles() []string {
 	return staged
 }
 
-// buildFileMapFromTree returns a map from relative file paths to blob hashes by traversing the tree recursively.
-func buildFileMapFromTree(repoRoot string, tree *objects.TreeObject, basePath string) (map[string]string, error) {
+// buildFileMapFromTree returns a map from relative file paths to blob hashes by traversing the tree recursively using Repository context.
+func buildFileMapFromTree(repo *core.Repository, tree *objects.TreeObject, basePath string) (map[string]string, error) {
 	fileMap := make(map[string]string)
 	for _, entry := range tree.Entries {
 		currentPath := filepath.Join(basePath, entry.Name)
 		if entry.Type == "blob" {
 			fileMap[currentPath] = entry.Hash
 		} else if entry.Type == "tree" {
-			subTree, err := objects.GetTree(repoRoot, entry.Hash)
+			subTree, err := objects.GetTree(repo.Root, entry.Hash)
 			if err != nil {
 				return nil, fmt.Errorf("failed to get subtree '%s': %w", entry.Hash, err)
 			}
-			subMap, err := buildFileMapFromTree(repoRoot, subTree, currentPath)
+			subMap, err := buildFileMapFromTree(repo, subTree, currentPath)
 			if err != nil {
 				return nil, err
 			}
@@ -197,15 +171,11 @@ func buildFileMapFromTree(repoRoot string, tree *objects.TreeObject, basePath st
 	return fileMap, nil
 }
 
-// HasUncommittedChanges checks for uncommitted changes for tracked files (legacy function)
-func (i *Index) HasUncommittedChanges(repoRoot string) bool {
-	repo := core.NewRepository(repoRoot)
-	return i.HasUncommittedChangesRepo(repo)
-}
 
-// HasUncommittedChangesRepo checks for uncommitted changes for tracked files using Repository context
+
+// HasUncommittedChanges checks for uncommitted changes for tracked files using Repository context
 // by comparing the index (stage 0) with the HEAD tree (built recursively) and the working directory.
-func (i *Index) HasUncommittedChangesRepo(repo *core.Repository) bool {
+func (i *Index) HasUncommittedChanges(repo *core.Repository) bool {
 	// Retrieve the HEAD commit and its tree
 	headCommitID, err := utils.ReadHEAD(repo.Root)
 	if err != nil {
@@ -226,7 +196,7 @@ func (i *Index) HasUncommittedChangesRepo(repo *core.Repository) bool {
 	// Build maps for comparison using the recursive helper
 	headTreeMap := make(map[string]string) // filepath -> hash
 	if headTree != nil {
-		m, err := buildFileMapFromTree(repo.Root, headTree, "")
+		m, err := buildFileMapFromTree(repo, headTree, "")
 		if err != nil {
 			return true // Assume changes if unable to build file map
 		}
@@ -283,15 +253,9 @@ func (i *Index) HasUncommittedChangesRepo(repo *core.Repository) bool {
 	return false
 }
 
-// IsClean returns true if there are no uncommitted changes in the working directory or index (legacy function).
-func (i *Index) IsClean(repoRoot string) bool {
-	repo := core.NewRepository(repoRoot)
-	return i.IsCleanRepo(repo)
-}
-
-// IsCleanRepo returns true if there are no uncommitted changes in the working directory or index using Repository context.
-func (i *Index) IsCleanRepo(repo *core.Repository) bool {
-	return !i.HasUncommittedChangesRepo(repo)
+// IsClean returns true if there are no uncommitted changes in the working directory or index using Repository context.
+func (i *Index) IsClean(repo *core.Repository) bool {
+	return !i.HasUncommittedChanges(repo)
 }
 
 // Serialize serializes the index to a byte slice.
@@ -370,20 +334,14 @@ func (i *Index) Serialize() ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// DeserializeIndex deserializes a byte slice into an Index (legacy function).
-func DeserializeIndex(repoRoot string, data []byte) (*Index, error) {
-	repo := core.NewRepository(repoRoot)
-	return DeserializeIndexRepo(repo, data)
-}
-
-// DeserializeIndexRepo deserializes a byte slice into an Index using Repository context.
-func DeserializeIndexRepo(repo *core.Repository, data []byte) (*Index, error) {
+// DeserializeIndex deserializes a byte slice into an Index using Repository context.
+func DeserializeIndex(repo *core.Repository, data []byte) (*Index, error) {
 	if len(data) < 4 {
 		return nil, fmt.Errorf("invalid index data: too short")
 	}
 
 	buf := bytes.NewReader(data)
-	index := NewIndexRepo(repo)
+	index := NewIndex(repo)
 
 	// Read the number of entries
 	var numEntries uint32
@@ -459,16 +417,10 @@ func DeserializeIndexRepo(repo *core.Repository, data []byte) (*Index, error) {
 	return index, nil
 }
 
-// CreateTreeFromIndex builds a Git-style tree object directly from the index (legacy function).
-func CreateTreeFromIndex(repoRoot string, index *Index) (string, error) {
-	repo := core.NewRepository(repoRoot)
-	return CreateTreeFromIndexRepo(repo, index)
-}
-
-// CreateTreeFromIndexRepo builds a Git-style tree object directly from the index using Repository context.
+// CreateTreeFromIndex builds a Git-style tree object directly from the index using Repository context.
 // It walks over stage-0 index entries, groups files into the proper directory structure
 // (ensuring every intermediate directory is present), and returns the hash of the root tree.
-func CreateTreeFromIndexRepo(repo *core.Repository, index *Index) (string, error) {
+func CreateTreeFromIndex(repo *core.Repository, index *Index) (string, error) {
 	if repo.Root == "" {
 		return "", fmt.Errorf("repository root cannot be empty")
 	}
@@ -504,6 +456,8 @@ func CreateTreeFromIndexRepo(repo *core.Repository, index *Index) (string, error
 
 	return rootHash, nil
 }
+
+
 
 // buildTreeMapFromIndex constructs a mapping of directory paths to TreeEntry objects
 // from the index entries. This is a helper function for CreateTreeFromIndex.

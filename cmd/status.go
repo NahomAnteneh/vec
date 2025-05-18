@@ -22,7 +22,7 @@ var (
 // StatusHandler handles the 'status' command
 func StatusHandler(repo *core.Repository, args []string) error {
 	// Load the index
-	index, err := staging.LoadIndexRepo(repo)
+	index, err := staging.LoadIndex(repo)
 	if err != nil {
 		return fmt.Errorf("failed to read index: %w", err)
 	}
@@ -48,7 +48,7 @@ func StatusHandler(repo *core.Repository, args []string) error {
 	}
 
 	// Compare states
-	statusInfo, err := compareStatusRepo(repo, index, commitTree)
+	statusInfo, err := compareStatus(repo, index, commitTree)
 	if err != nil {
 		return fmt.Errorf("failed to compare status: %w", err)
 	}
@@ -243,9 +243,9 @@ func computeFileBlobHash(path string) (string, error) {
 	return utils.HashBytes("blob", data), nil
 }
 
-// compareStatusRepo compares the working directory, index, and commit tree
+// compareStatus compares the working directory, index, and commit tree
 // to determine the status of files in the repository using Repository context
-func compareStatusRepo(repo *core.Repository, index *staging.Index, commitTree *objects.TreeObject) (*StatusInfo, error) {
+func compareStatus(repo *core.Repository, index *staging.Index, commitTree *objects.TreeObject) (*StatusInfo, error) {
 	status := &StatusInfo{
 		NewFiles:          []string{},
 		StagedModified:    []string{},
@@ -278,7 +278,7 @@ func compareStatusRepo(repo *core.Repository, index *staging.Index, commitTree *
 	// Build a map from file path to tree entry from the commit tree
 	commitTreeMap := make(map[string]objects.TreeEntry)
 	if commitTree != nil {
-		buildCommitTreeMapRepo(repo, commitTree, "", commitTreeMap)
+		buildCommitTreeMap(repo, commitTree, "", commitTreeMap)
 	}
 
 	// Build a map of staged files
@@ -410,13 +410,10 @@ func compareStatusRepo(repo *core.Repository, index *staging.Index, commitTree *
 	return status, nil
 }
 
-// Legacy function for backward compatibility
-func compareStatus(repo *core.Repository, index *staging.Index, commitTree *objects.TreeObject) (*StatusInfo, error) {
-	return compareStatusRepo(repo, index, commitTree)
-}
 
-// buildCommitTreeMapRepo recursively builds a map of file paths to tree entries from a tree object using Repository context
-func buildCommitTreeMapRepo(repo *core.Repository, tree *objects.TreeObject, parentPath string, treeMap map[string]objects.TreeEntry) {
+
+// buildCommitTreeMap recursively builds a map of file paths to tree entries from a tree object using Repository context
+func buildCommitTreeMap(repo *core.Repository, tree *objects.TreeObject, parentPath string, treeMap map[string]objects.TreeEntry) {
 	for _, entry := range tree.Entries {
 		path := filepath.Join(parentPath, entry.Name)
 		if entry.Type == "blob" {
@@ -427,13 +424,9 @@ func buildCommitTreeMapRepo(repo *core.Repository, tree *objects.TreeObject, par
 				// Skip subtrees we can't load
 				continue
 			}
-			buildCommitTreeMapRepo(repo, subTree, path, treeMap)
+			buildCommitTreeMap(repo, subTree, path, treeMap)
 		}
 	}
 }
 
-// Legacy function for backward compatibility
-func buildCommitTreeMap(repoRoot string, tree *objects.TreeObject, parentPath string, treeMap map[string]objects.TreeEntry) {
-	repo := core.NewRepository(repoRoot)
-	buildCommitTreeMapRepo(repo, tree, parentPath, treeMap)
-}
+

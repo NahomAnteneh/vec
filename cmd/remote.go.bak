@@ -153,67 +153,6 @@ var showRemoteCmd = &cobra.Command{
 		} else {
 			fmt.Printf("  No branches tracked\n")
 		}
-
-		// Display last fetch time if available
-		if remoteInfo.LastFetched > 0 {
-			lastFetchedTime := utils.FormatTimestamp(remoteInfo.LastFetched)
-			fmt.Printf("  Last fetched: %s\n", lastFetchedTime)
-		}
-	},
-}
-
-// setUrlCmd represents the 'remote set-url' command
-var setUrlCmd = &cobra.Command{
-	Use:   "set-url <name> <url>",
-	Short: "Change the URL for a remote",
-	Long:  `Changes the URL for the remote named <name>.`,
-	Args:  cobra.ExactArgs(2),
-	Run: func(cmd *cobra.Command, args []string) {
-		name := args[0]
-		url := args[1]
-
-		// Get repository root
-		repoRoot, err := utils.GetVecRoot()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
-
-		// Update the URL
-		if err := remote.SetRemoteURL(repoRoot, name, url); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
-
-		fmt.Printf("Updated URL for remote '%s' to '%s'\n", name, url)
-	},
-}
-
-// setCredentialsCmd represents the 'remote set-credentials' command
-var setCredentialsCmd = &cobra.Command{
-	Use:   "set-credentials <name> <username> <password>",
-	Short: "Set authentication credentials for a remote",
-	Long:  `Sets the username and password for authenticating with the remote named <name>.`,
-	Args:  cobra.ExactArgs(3),
-	Run: func(cmd *cobra.Command, args []string) {
-		name := args[0]
-		username := args[1]
-		password := args[2]
-
-		// Get repository root
-		repoRoot, err := utils.GetVecRoot()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
-
-		// Set credentials
-		if err := remote.SetRemoteAuth(repoRoot, name, username, password); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
-
-		fmt.Printf("Stored credentials for remote '%s'\n", name)
 	},
 }
 
@@ -277,8 +216,6 @@ func init() {
 	remoteCmd.AddCommand(addRemoteCmd)
 	remoteCmd.AddCommand(removeRemoteCmd)
 	remoteCmd.AddCommand(showRemoteCmd)
-	remoteCmd.AddCommand(setUrlCmd)
-	remoteCmd.AddCommand(setCredentialsCmd)
 
 	// Add flags
 	remoteCmd.Flags().BoolVarP(&remoteVerbose, "verbose", "v", false, "Show remote URL after name")

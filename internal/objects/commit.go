@@ -117,14 +117,21 @@ func deserializeCommit(data []byte) (*Commit, error) {
 	return commit, nil
 }
 
-// CreateCommit creates a new commit object, including the header (legacy function).
-func CreateCommit(repoRoot, treeHash string, parentHashes []string, author, committer, message string, timestamp int64) (string, error) {
-	repo := core.NewRepository(repoRoot)
-	return CreateCommitRepo(repo, treeHash, parentHashes, author, committer, message, timestamp)
-}
-
 // CreateCommitRepo creates a new commit object using Repository context.
 func CreateCommitRepo(repo *core.Repository, treeHash string, parentHashes []string, author, committer, message string, timestamp int64) (string, error) {
+	// Validate inputs
+	if treeHash == "" {
+		return "", fmt.Errorf("tree hash cannot be empty")
+	}
+	
+	if author == "" || committer == "" {
+		return "", fmt.Errorf("author and committer cannot be empty")
+	}
+	
+	if timestamp == 0 {
+		timestamp = time.Now().Unix()
+	}
+
 	commit := &Commit{
 		Tree:      treeHash,
 		Parents:   parentHashes,
@@ -148,26 +155,35 @@ func CreateCommitRepo(repo *core.Repository, treeHash string, parentHashes []str
 	content := buf.Bytes()
 
 	// Compute the hash of the entire content
-	hash := utils.HashBytes("commit", content)
+	hash := utils.HashBytes(content)
 	commit.CommitID = hash
 
-	// Store the commit object on disk
+	// Check if the object already exists
 	objectPath := GetObjectPathRepo(repo, hash)
+	if utils.FileExists(objectPath) {
+		return hash, nil
+	}
+
+	// Store the commit object on disk
 	objectDir := filepath.Dir(objectPath)
 	if err := utils.EnsureDirExists(objectDir); err != nil {
 		return "", fmt.Errorf("failed to create directory for commit: %w", err)
 	}
-	if err := os.WriteFile(objectPath, content, 0644); err != nil {
+	
+	// Create a temporary file for atomic write
+	tempPath := objectPath + ".tmp"
+	if err := os.WriteFile(tempPath, content, 0644); err != nil {
+		os.Remove(tempPath)
 		return "", fmt.Errorf("failed to write commit file: %w", err)
+	}
+	
+	// Atomic rename
+	if err := os.Rename(tempPath, objectPath); err != nil {
+		os.Remove(tempPath)
+		return "", fmt.Errorf("failed to finalize commit file: %w", err)
 	}
 
 	return hash, nil
-}
-
-// GetCommit reads a commit object from disk (legacy function).
-func GetCommit(repoRoot string, hash string) (*Commit, error) {
-	repo := core.NewRepository(repoRoot)
-	return GetCommitRepo(repo, hash)
 }
 
 // GetCommitRepo reads a commit object from disk using Repository context.
@@ -183,6 +199,14 @@ func GetCommitRepo(repo *core.Repository, hash string) (*Commit, error) {
 	if headerEnd == -1 {
 		return nil, fmt.Errorf("invalid commit format: missing header")
 	}
+	
+	// Validate header format
+	header := string(content[:headerEnd])
+	expectedHeader := fmt.Sprintf("commit %d", len(content)-headerEnd-1)
+	if header != expectedHeader {
+		return nil, fmt.Errorf("invalid commit header: got '%s', expected '%s'", header, expectedHeader)
+	}
+	
 	commitContent := content[headerEnd+1:]
 
 	// Deserialize the commit

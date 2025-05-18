@@ -31,11 +31,11 @@ func CheckoutHandler(repo *core.Repository, args []string) error {
 // and then checks it out.
 func checkoutRepo(repo *core.Repository, target string) error {
 	// Load index and check for uncommitted changes.
-	index, err := staging.LoadIndexRepo(repo)
+	index, err := staging.LoadIndex(repo)
 	if err != nil {
 		return core.IndexError("failed to load index", err)
 	}
-	if !index.IsCleanRepo(repo) && !forceCheckout {
+	if !index.IsClean(repo) && !forceCheckout {
 		return core.RepositoryError("your local changes would be overwritten by checkout; please commit or stash them first (or use --force to discard changes)", nil)
 	}
 
@@ -123,10 +123,10 @@ func checkoutRepo(repo *core.Repository, target string) error {
 	}
 
 	// Update working directory and index.
-	if err := updateWorkingDirectoryRepo(repo, targetTree, ""); err != nil {
+	if err := updateWorkingDirectory(repo, targetTree, ""); err != nil {
 		return core.FSError("failed to update working directory", err)
 	}
-	newIndex, err := createIndexFromTreeRepo(repo, targetTree, "")
+	newIndex, err := createIndexFromTree(repo, targetTree, "")
 	if err != nil {
 		return core.IndexError("failed to update index", err)
 	}
@@ -140,7 +140,7 @@ func checkoutRepo(repo *core.Repository, target string) error {
 	if isBranch {
 		refName = target
 	}
-	if err := updateReflogForCheckoutRepo(repo, prevCommitID, targetCommitID, refName, "checkout", "moving to "+target); err != nil {
+	if err := updateReflogForCheckout(repo, prevCommitID, targetCommitID, refName, "checkout", "moving to "+target); err != nil {
 		return core.RefError("failed to update reflog", err)
 	}
 
@@ -148,20 +148,17 @@ func checkoutRepo(repo *core.Repository, target string) error {
 	return nil
 }
 
-// Legacy function for backward compatibility
-func checkout(repo *core.Repository, target string) error {
-	return checkoutRepo(repo, target)
-}
 
-// updateWorkingDirectoryRepo updates the working directory to match the given tree using Repository context
-func updateWorkingDirectoryRepo(repo *core.Repository, tree *objects.TreeObject, basePath string) error {
-	currentFiles, err := getWorkingDirFilesRepo(repo)
+
+// updateWorkingDirectory updates the working directory to match the given tree using Repository context
+func updateWorkingDirectory(repo *core.Repository, tree *objects.TreeObject, basePath string) error {
+	currentFiles, err := getWorkingDirFiles(repo)
 	if err != nil {
 		return fmt.Errorf("failed to scan working directory: %w", err)
 	}
 
 	treeFiles := make(map[string]objects.TreeEntry)
-	collectTreeEntriesRepo(repo, tree, basePath, treeFiles)
+	collectTreeEntries(repo, tree, basePath, treeFiles)
 
 	for relPath, entry := range treeFiles {
 		if entry.Type != "blob" {
@@ -189,22 +186,18 @@ func updateWorkingDirectoryRepo(repo *core.Repository, tree *objects.TreeObject,
 	}
 
 	validDirs := make(map[string]struct{})
-	collectTreeDirectoriesRepo(repo, tree, basePath, validDirs)
-	if err := removeExtraDirectoriesRepo(repo, validDirs); err != nil {
+	collectTreeDirectories(repo, tree, basePath, validDirs)
+	if err := removeExtraDirectories(repo, validDirs); err != nil {
 		return fmt.Errorf("failed to remove extra directories: %w", err)
 	}
 
 	return nil
 }
 
-// Legacy function for backward compatibility
-func updateWorkingDirectory(repoRoot string, tree *objects.TreeObject, basePath string) error {
-	repo := core.NewRepository(repoRoot)
-	return updateWorkingDirectoryRepo(repo, tree, basePath)
-}
 
-// getWorkingDirFilesRepo scans the working directory and returns a map of files (excluding .vec directory)
-func getWorkingDirFilesRepo(repo *core.Repository) (map[string]struct{}, error) {
+
+// getWorkingDirFiles scans the working directory and returns a map of files (excluding .vec directory)
+func getWorkingDirFiles(repo *core.Repository) (map[string]struct{}, error) {
 	files := make(map[string]struct{})
 	err := filepath.Walk(repo.Root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -229,14 +222,10 @@ func getWorkingDirFilesRepo(repo *core.Repository) (map[string]struct{}, error) 
 	return files, err
 }
 
-// Legacy function for backward compatibility
-func getWorkingDirFiles(repoRoot string) (map[string]struct{}, error) {
-	repo := core.NewRepository(repoRoot)
-	return getWorkingDirFilesRepo(repo)
-}
 
-// collectTreeEntriesRepo recursively collects all blob entries from a tree and subtrees
-func collectTreeEntriesRepo(repo *core.Repository, tree *objects.TreeObject, prefix string, entries map[string]objects.TreeEntry) {
+
+// collectTreeEntries recursively collects all blob entries from a tree and subtrees
+func collectTreeEntries(repo *core.Repository, tree *objects.TreeObject, prefix string, entries map[string]objects.TreeEntry) {
 	for _, entry := range tree.Entries {
 		entryPath := filepath.Join(prefix, entry.Name)
 		entries[entryPath] = entry
@@ -244,20 +233,16 @@ func collectTreeEntriesRepo(repo *core.Repository, tree *objects.TreeObject, pre
 		if entry.Type == "tree" {
 			subTree, err := objects.GetTree(repo.Root, entry.Hash)
 			if err == nil {
-				collectTreeEntriesRepo(repo, subTree, entryPath, entries)
+				collectTreeEntries(repo, subTree, entryPath, entries)
 			}
 		}
 	}
 }
 
-// Legacy function for backward compatibility
-func collectTreeEntries(repoRoot string, tree *objects.TreeObject, prefix string, entries map[string]objects.TreeEntry) {
-	repo := core.NewRepository(repoRoot)
-	collectTreeEntriesRepo(repo, tree, prefix, entries)
-}
 
-// collectTreeDirectoriesRepo recursively collects all directory paths from a tree and subtrees
-func collectTreeDirectoriesRepo(repo *core.Repository, tree *objects.TreeObject, prefix string, dirs map[string]struct{}) {
+
+// collectTreeDirectories recursively collects all directory paths from a tree and subtrees
+func collectTreeDirectories(repo *core.Repository, tree *objects.TreeObject, prefix string, dirs map[string]struct{}) {
 	// Add current directory
 	if prefix != "" {
 		dirs[prefix] = struct{}{}
@@ -270,20 +255,16 @@ func collectTreeDirectoriesRepo(repo *core.Repository, tree *objects.TreeObject,
 
 			subTree, err := objects.GetTree(repo.Root, entry.Hash)
 			if err == nil {
-				collectTreeDirectoriesRepo(repo, subTree, entryPath, dirs)
+				collectTreeDirectories(repo, subTree, entryPath, dirs)
 			}
 		}
 	}
 }
 
-// Legacy function for backward compatibility
-func collectTreeDirectories(repoRoot string, tree *objects.TreeObject, prefix string, dirs map[string]struct{}) {
-	repo := core.NewRepository(repoRoot)
-	collectTreeDirectoriesRepo(repo, tree, prefix, dirs)
-}
 
-// removeExtraDirectoriesRepo removes directories that aren't in the validDirs map
-func removeExtraDirectoriesRepo(repo *core.Repository, validDirs map[string]struct{}) error {
+
+// removeExtraDirectories removes directories that aren't in the validDirs map
+func removeExtraDirectories(repo *core.Repository, validDirs map[string]struct{}) error {
 	// Get all directories (excluding .vec)
 	var dirs []string
 	err := filepath.Walk(repo.Root, func(path string, info os.FileInfo, err error) error {
@@ -331,19 +312,15 @@ func removeExtraDirectoriesRepo(repo *core.Repository, validDirs map[string]stru
 	return nil
 }
 
-// Legacy function for backward compatibility
-func removeExtraDirectories(repoRoot string, validDirs map[string]struct{}) error {
-	repo := core.NewRepository(repoRoot)
-	return removeExtraDirectoriesRepo(repo, validDirs)
-}
 
-// createIndexFromTreeRepo creates a new index from a tree using Repository context
-func createIndexFromTreeRepo(repo *core.Repository, tree *objects.TreeObject, basePath string) (*staging.Index, error) {
-	index := staging.NewIndexRepo(repo)
+
+// createIndexFromTree creates a new index from a tree using Repository context
+func createIndexFromTree(repo *core.Repository, tree *objects.TreeObject, basePath string) (*staging.Index, error) {
+	index := staging.NewIndex(repo)
 
 	// Collect all blob entries
 	entries := make(map[string]objects.TreeEntry)
-	collectTreeEntriesRepo(repo, tree, basePath, entries)
+	collectTreeEntries(repo, tree, basePath, entries)
 
 	// Add each entry to the index
 	for path, entry := range entries {
@@ -364,7 +341,7 @@ func createIndexFromTreeRepo(repo *core.Repository, tree *objects.TreeObject, ba
 				}
 			}
 
-			if err := index.AddRepo(repo, path, entry.Hash); err != nil {
+			if err := index.Add(repo, path, entry.Hash); err != nil {
 				return nil, fmt.Errorf("failed to add %s to index: %w", path, err)
 			}
 		}
@@ -373,14 +350,10 @@ func createIndexFromTreeRepo(repo *core.Repository, tree *objects.TreeObject, ba
 	return index, nil
 }
 
-// Legacy function for backward compatibility
-func createIndexFromTree(repoRoot string, tree *objects.TreeObject, basePath string) (*staging.Index, error) {
-	repo := core.NewRepository(repoRoot)
-	return createIndexFromTreeRepo(repo, tree, basePath)
-}
 
-// updateReflogForCheckoutRepo updates the reflog for the given reference using Repository context
-func updateReflogForCheckoutRepo(repo *core.Repository, prevCommitID, newCommitID, ref, action, details string) error {
+
+// updateReflogForCheckout updates the reflog for the given reference using Repository context
+func updateReflogForCheckout(repo *core.Repository, prevCommitID, newCommitID, ref, action, details string) error {
 	reflogDir := filepath.Join(repo.VecDir, "logs", "refs", "heads")
 	headReflogPath := filepath.Join(repo.VecDir, "logs", "HEAD")
 
@@ -460,11 +433,7 @@ func updateReflogForCheckoutRepo(repo *core.Repository, prevCommitID, newCommitI
 	return nil
 }
 
-// Legacy function for backward compatibility
-func updateReflog(repoRoot, prevCommitID, newCommitID, ref, action, details string) error {
-	repo := core.NewRepository(repoRoot)
-	return updateReflogForCheckoutRepo(repo, prevCommitID, newCommitID, ref, action, details)
-}
+
 
 func init() {
 	checkoutCmd := NewRepoCommand(

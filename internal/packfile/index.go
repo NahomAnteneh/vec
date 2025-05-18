@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
+	"strconv"
 )
 
 // ReadPackIndex reads a packfile index from the given path
@@ -112,11 +114,11 @@ func ReadPackIndex(indexPath string) (*PackfileIndex, error) {
 			finalOffset = uint64(offset)
 		}
 
-		// For simplicity, set all objects as blob type
-		// In a real system, you'd determine the type from the packfile
+		// We'll determine the actual object type when reading the packfile
+		// Just store the offset for now
 		index.Entries[sha1Hex] = PackIndexEntry{
 			Offset: finalOffset,
-			Type:   OBJ_BLOB,
+			Type:   OBJ_NONE, // Will be determined when reading the packfile
 		}
 
 		// Return to reading SHA-1 values
@@ -153,17 +155,22 @@ func WritePackIndex(index *PackfileIndex, indexPath string) error {
 		sha1s = append(sha1s, sha1Hex)
 	}
 
-	// Sort SHA-1 values for the fanout table
-	// For simplicity, we're not actually sorting here
-	// In a real implementation, you'd sort the SHA-1 values
+	// Sort SHA-1 values lexicographically
+	sortSHA1s(sha1s)
 
-	// Build fanout table
-	for range sha1s {
-		// In a real implementation, you'd increment the counter for the first byte
-		// Here we just set all counters to the total number of objects
-		firstByte := 0 // should be byte value of first byte of sha1
-		for i := firstByte; i < 256; i++ {
-			fanout[i]++
+	// Build fanout table - count how many objects start with each byte value
+	for _, sha1Hex := range sha1s {
+		// Convert first byte of hex string to byte value (two hex chars = one byte)
+		if len(sha1Hex) >= 2 {
+			firstByteVal, err := hexByteValue(sha1Hex[:2])
+			if err != nil {
+				return fmt.Errorf("invalid SHA-1 hex: %s: %w", sha1Hex, err)
+			}
+			
+			// Increment counters for this byte and all higher values
+			for i := int(firstByteVal); i < 256; i++ {
+				fanout[i]++
+			}
 		}
 	}
 
@@ -286,4 +293,23 @@ func VerifyPackIndex(indexPath, packfilePath string) error {
 	}
 
 	return nil
+}
+
+// sortSHA1s sorts SHA-1 hex strings in ascending order
+func sortSHA1s(sha1s []string) {
+	sort.Strings(sha1s)
+}
+
+// hexByteValue converts a 2-character hex string to a byte value
+func hexByteValue(hex string) (byte, error) {
+	if len(hex) != 2 {
+		return 0, fmt.Errorf("invalid hex string length: %d", len(hex))
+	}
+	
+	val, err := strconv.ParseUint(hex, 16, 8)
+	if err != nil {
+		return 0, err
+	}
+	
+	return byte(val), nil
 }

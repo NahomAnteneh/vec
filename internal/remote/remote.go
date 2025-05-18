@@ -1,11 +1,14 @@
 package remote
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -92,6 +95,9 @@ func RemoveRemote(repoRoot, name string) error {
 		}
 	}
 
+	// Remove credentials for this remote
+	ClearCredentials(name)
+
 	// Remove from config
 	if err := cfg.RemoveRemote(name); err != nil {
 		return fmt.Errorf("failed to remove remote from config: %w", err)
@@ -175,8 +181,8 @@ func SetRemoteURL(repoRoot, name, url string) error {
 	return nil
 }
 
-// SetRemoteAuth sets authentication information for a remote
-func SetRemoteAuth(repoRoot, name, authToken string) error {
+// SetRemoteAuth sets authentication credentials for a remote
+func SetRemoteAuth(repoRoot, name, username, password string) error {
 	// Load config
 	cfg, err := config.LoadConfig(repoRoot)
 	if err != nil {
@@ -188,104 +194,103 @@ func SetRemoteAuth(repoRoot, name, authToken string) error {
 		return fmt.Errorf("%w: %s", ErrRemoteNotFound, name)
 	}
 
-	// Set auth token
-	if err := cfg.SetRemoteAuth(name, authToken); err != nil {
-		return fmt.Errorf("failed to set remote auth: %w", err)
-	}
-
-	// Save config
-	if err := cfg.Write(); err != nil {
-		return fmt.Errorf("failed to save config: %w", err)
+	// Store credentials
+	if err := StoreCredentials(name, username, password); err != nil {
+		return fmt.Errorf("failed to store credentials: %w", err)
 	}
 
 	return nil
 }
 
-// ListRemotes retrieves information about all configured remotes
-func ListRemotes(repoRoot string) (map[string]RemoteInfo, error) {
-	remotes := make(map[string]RemoteInfo)
+// GetRemoteURL retrieves the URL for a given remote name
+func GetRemoteURL(repoRoot, remoteName string) (string, error) {
+	// Load config
+	cfg, err := config.LoadConfig(repoRoot)
+	if err != nil {
+		return "", fmt.Errorf("failed to load config: %w", err)
+	}
 
-	// Load config to get remote URLs
+	// Get remote URL
+	remoteURL, err := cfg.GetRemoteURL(remoteName)
+	if err != nil {
+		return "", err
+	}
+
+	if remoteURL == "" {
+		return "", fmt.Errorf("remote '%s' not found or has no URL configured", remoteName)
+	}
+
+	return remoteURL, nil
+}
+
+// ListRemotes lists all configured remotes for the repository
+func ListRemotes(repoRoot string) (map[string]RemoteInfo, error) {
+	// Load config
 	cfg, err := config.LoadConfig(repoRoot)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load config: %w", err)
 	}
 
-	// Get all configured remotes
-	remoteURLs := cfg.Remotes
-	if len(remoteURLs) == 0 {
-		return remotes, nil
-	}
-
-	for name, remote := range remoteURLs {
+	result := make(map[string]RemoteInfo)
+	for name, remote := range cfg.Remotes {
+		branches, _ := listRemoteBranches(repoRoot, name)
+		
 		info := RemoteInfo{
-			Name: name,
-			URL:  remote.URL,
+			Name:     name,
+			URL:      remote.URL,
+			Branches: branches,
 		}
-
-		// Get tracked branches for this remote
-		remoteBranchesDir := filepath.Join(repoRoot, ".vec", "refs", "remotes", name)
-		if _, err := os.Stat(remoteBranchesDir); err == nil {
-			branches, err := getBranchesForRemote(remoteBranchesDir)
-			if err == nil && len(branches) > 0 {
-				info.Branches = branches
-				// Assume first branch is default if we have branches
-				info.DefaultBranch = branches[0]
+		
+		// Try to read last fetched info
+		fetchInfoPath := filepath.Join(repoRoot, ".vec", "refs", "remotes", name, "FETCH_HEAD")
+		if utils.FileExists(fetchInfoPath) {
+			fetchInfo, err := os.ReadFile(fetchInfoPath)
+			if err == nil {
+				info.LastFetched = parseLastFetchedTime(string(fetchInfo))
 			}
 		}
-
-		// Get last fetched time if available
-		fetchInfoPath := filepath.Join(repoRoot, ".vec", "FETCH_INFO", name)
-		if fetchInfo, err := os.ReadFile(fetchInfoPath); err == nil {
-			info.LastFetched = parseLastFetchedTime(string(fetchInfo))
-		}
-
-		remotes[name] = info
+		
+		result[name] = info
 	}
 
-	return remotes, nil
+	return result, nil
 }
 
-// Helper function to get branches for a remote
+// getBranchesForRemote lists all branches for a remote
 func getBranchesForRemote(remoteBranchesDir string) ([]string, error) {
-	var branches []string
+	if !utils.FileExists(remoteBranchesDir) {
+		return []string{}, nil
+	}
 
-	err := filepath.Walk(remoteBranchesDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
+	entries, err := os.ReadDir(remoteBranchesDir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read remote branches directory: %w", err)
+	}
 
-		if !info.IsDir() {
-			relPath, err := filepath.Rel(remoteBranchesDir, path)
-			if err != nil {
-				return err
-			}
-			branches = append(branches, relPath)
-		}
-
-		return nil
-	})
-
-	return branches, err
-}
-
-// Helper to parse last fetched time from fetch info file
-func parseLastFetchedTime(fetchInfo string) int64 {
-	lines := strings.Split(fetchInfo, "\n")
-	for _, line := range lines {
-		if strings.HasPrefix(line, "timestamp:") {
-			parts := strings.SplitN(line, ":", 2)
-			if len(parts) == 2 {
-				var timestamp int64
-				fmt.Sscanf(parts[1], "%d", &timestamp)
-				return timestamp
-			}
+	branches := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.IsDir() && entry.Name() != "HEAD" && entry.Name() != "FETCH_HEAD" {
+			branches = append(branches, entry.Name())
 		}
 	}
-	return 0
+
+	return branches, nil
 }
 
-// GetRemoteInfo retrieves detailed information about a specific remote
+// parseLastFetchedTime extracts timestamp from fetch info
+func parseLastFetchedTime(fetchInfo string) int64 {
+	// Look for timestamp in fetch info
+	index := strings.Index(fetchInfo, "# last_fetched=")
+	if index == -1 {
+		return 0
+	}
+	
+	timestampStr := strings.TrimSpace(fetchInfo[index+len("# last_fetched="):])
+	timestamp, _ := strconv.ParseInt(timestampStr, 10, 64)
+	return timestamp
+}
+
+// GetRemoteInfo gets detailed information about a remote
 func GetRemoteInfo(repoRoot, name string) (*RemoteInfo, error) {
 	// Load config
 	cfg, err := config.LoadConfig(repoRoot)
@@ -299,93 +304,64 @@ func GetRemoteInfo(repoRoot, name string) (*RemoteInfo, error) {
 		return nil, fmt.Errorf("%w: %s", ErrRemoteNotFound, name)
 	}
 
-	// Get list of remote branches
 	branches, _ := listRemoteBranches(repoRoot, name)
-
-	// Determine default branch
-	defaultBranch := "main" // Default
-	if len(branches) > 0 {
-		defaultBranch = branches[0]
+	
+	info := &RemoteInfo{
+		Name:     name,
+		URL:      remote.URL,
+		Branches: branches,
+	}
+	
+	// Try to read last fetched info
+	fetchInfoPath := filepath.Join(repoRoot, ".vec", "refs", "remotes", name, "FETCH_HEAD")
+	if utils.FileExists(fetchInfoPath) {
+		fetchInfo, err := os.ReadFile(fetchInfoPath)
+		if err == nil {
+			info.LastFetched = parseLastFetchedTime(string(fetchInfo))
+		}
 	}
 
-	return &RemoteInfo{
-		Name:          name,
-		URL:           remote.URL,
-		DefaultBranch: defaultBranch,
-		Branches:      branches,
-	}, nil
+	return info, nil
 }
 
-// ListRemoteBranches lists all branches from a specific remote
+// listRemoteBranches lists all branches for a remote
 func listRemoteBranches(repoRoot, remoteName string) ([]string, error) {
-	branches := []string{}
-
 	remoteBranchesDir := filepath.Join(repoRoot, ".vec", "refs", "remotes", remoteName)
-	if !utils.FileExists(remoteBranchesDir) {
-		return branches, nil
-	}
-
-	err := filepath.Walk(remoteBranchesDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-
-		if !info.IsDir() {
-			relPath, err := filepath.Rel(remoteBranchesDir, path)
-			if err != nil {
-				return err
-			}
-			branches = append(branches, relPath)
-		}
-
-		return nil
-	})
-
-	if err != nil {
-		return nil, fmt.Errorf("failed to list remote branches: %w", err)
-	}
-
-	return branches, nil
+	return getBranchesForRemote(remoteBranchesDir)
 }
 
-// makeRemoteRequest performs an HTTP request to a remote repository
-// This is now a wrapper that delegates to the centralized HTTP client
+// makeRemoteRequest sends an HTTP request to the remote repository
 func makeRemoteRequest(remoteURL, endpoint string, method string, data interface{}, cfg *config.Config, remoteName string) (*http.Response, error) {
-	// Use the new centralized HTTP client
-	return vechttp.MakeRemoteRequest(remoteURL, endpoint, method, data, cfg, remoteName)
-}
-
-// logRequestInfo logs non-sensitive information about the request
-func logRequestInfo(req *http.Request) {
-	// Don't log in production builds, just for development
-	// Remove or comment out these lines in production
-	fmt.Printf("Request: %s %s\n", req.Method, req.URL.String())
-	fmt.Println("Headers:")
-	for name, values := range req.Header {
-		// Don't log the full authorization token for security reasons
-		if strings.ToLower(name) == "authorization" {
-			fmt.Printf("  %s: Bearer [TOKEN REDACTED]\n", name)
-		} else {
-			fmt.Printf("  %s: %s\n", name, values)
+	client := vechttp.NewClient(remoteURL, remoteName, cfg)
+	client.SetTimeout(DefaultTimeout)
+	
+	var respData []byte
+	var err error
+	
+	if method == "GET" {
+		respData, err = client.Get(endpoint)
+		if err != nil {
+			return nil, fmt.Errorf("failed to make GET request: %w", err)
 		}
+	} else if method == "POST" {
+		respData, err = client.Post(endpoint, data)
+		if err != nil {
+			return nil, fmt.Errorf("failed to make POST request: %w", err)
+		}
+	} else {
+		return nil, fmt.Errorf("unsupported HTTP method: %s", method)
 	}
-	if req.Body != nil {
-		fmt.Println("Body: [CONTENT NOT LOGGED]")
+	
+	// Create a response object to return
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(strings.NewReader(string(respData))),
 	}
+	
+	return resp, nil
 }
 
-// logResponseInfo logs information about the response
-func logResponseInfo(resp *http.Response, message string) {
-	// Don't log in production builds, just for development
-	// Remove or comment out these lines in production
-	statusMsg := fmt.Sprintf("Response: %d %s", resp.StatusCode, resp.Status)
-	if message != "" {
-		statusMsg += " - " + message
-	}
-	fmt.Println(statusMsg)
-}
-
-// prune removes stale remote references
+// prune removes obsolete remote-tracking branches
 func prune(repoRoot, remoteName string) error {
 	// Load config
 	cfg, err := config.LoadConfig(repoRoot)
@@ -393,51 +369,50 @@ func prune(repoRoot, remoteName string) error {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
 
-	// Get remote URL
-	remoteURL, err := cfg.GetRemoteURL(remoteName)
+	// Check if remote exists
+	if _, exists := cfg.Remotes[remoteName]; !exists {
+		return fmt.Errorf("%w: %s", ErrRemoteNotFound, remoteName)
+	}
+
+	// Get current remote branches
+	remoteURL, err := GetRemoteURL(repoRoot, remoteName)
 	if err != nil {
 		return fmt.Errorf("failed to get remote URL: %w", err)
 	}
 
-	// Fetch remote refs directly from server
-	remoteRefs, err := fetchRemoteRefs(remoteURL, remoteName, cfg)
+	client := vechttp.NewClient(remoteURL, remoteName, cfg)
+	remoteRefs, err := client.GetRefs()
 	if err != nil {
-		return fmt.Errorf("failed to fetch remote refs: %w", err)
+		return fmt.Errorf("failed to get remote refs: %w", err)
 	}
 
-	// Get local tracking branches for this remote
-	remoteBranchesDir := filepath.Join(repoRoot, ".vec", "refs", "remotes", remoteName)
-	if !utils.FileExists(remoteBranchesDir) {
-		return nil // No local tracking branches
+	// Get local remote-tracking branches
+	localRemoteBranches, err := listRemoteBranches(repoRoot, remoteName)
+	if err != nil {
+		return fmt.Errorf("failed to list local remote branches: %w", err)
 	}
 
-	// Walk through all tracking refs and remove ones that don't exist on remote
-	return filepath.Walk(remoteBranchesDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
+	// Find obsolete branches
+	obsoleteBranches := make([]string, 0)
+	for _, branch := range localRemoteBranches {
+		refName := fmt.Sprintf("refs/heads/%s", branch)
+		if _, exists := remoteRefs[refName]; !exists {
+			obsoleteBranches = append(obsoleteBranches, branch)
 		}
+	}
 
-		if !info.IsDir() {
-			relPath, err := filepath.Rel(remoteBranchesDir, path)
-			if err != nil {
-				return err
-			}
-
-			// Check if the branch exists on remote
-			refKey := "refs/heads/" + relPath
-			if _, exists := remoteRefs[refKey]; !exists {
-				// Remove stale reference
-				if err := os.Remove(path); err != nil {
-					return fmt.Errorf("failed to remove stale reference %s: %w", relPath, err)
-				}
-			}
+	// Remove obsolete branches
+	for _, branch := range obsoleteBranches {
+		branchPath := filepath.Join(repoRoot, ".vec", "refs", "remotes", remoteName, branch)
+		if err := os.Remove(branchPath); err != nil {
+			return fmt.Errorf("failed to remove obsolete branch %s: %w", branch, err)
 		}
+	}
 
-		return nil
-	})
+	return nil
 }
 
-// MergeRemoteBranch merges a remote branch into the current branch (legacy function)
+// MergeRemoteBranch merges a remote branch into the current branch
 func MergeRemoteBranch(repoRoot, remoteName, remoteBranch string, interactive bool) error {
 	repo := core.NewRepository(repoRoot)
 	return MergeRemoteBranchRepo(repo, remoteName, remoteBranch, interactive)
@@ -445,93 +420,67 @@ func MergeRemoteBranch(repoRoot, remoteName, remoteBranch string, interactive bo
 
 // MergeRemoteBranchRepo merges a remote branch into the current branch using Repository context
 func MergeRemoteBranchRepo(repo *core.Repository, remoteName, remoteBranch string, interactive bool) error {
-	// Validate repository
-	vecDir := repo.VecDir
-	if _, err := os.Stat(vecDir); os.IsNotExist(err) {
-		return fmt.Errorf("not a vec repository: %s", repo.Root)
-	}
-
-	// Load config to get remote info
-	cfg, err := config.LoadConfig(repo.Root)
+	// Get current branch
+	currentBranch, err := repo.GetCurrentBranch()
 	if err != nil {
-		return fmt.Errorf("failed to load config: %w", err)
+		return fmt.Errorf("failed to get current branch: %w", err)
 	}
 
-	// Verify the remote exists
-	_, err = cfg.GetRemoteURL(remoteName)
-	if err != nil {
-		return fmt.Errorf("remote '%s' not found: %w", remoteName, err)
+	if currentBranch == "(HEAD detached)" {
+		return fmt.Errorf("cannot merge when in detached HEAD state")
 	}
 
-	// Check if the remote branch exists
-	remoteBranchPath := filepath.Join(vecDir, "refs", "remotes", remoteName, remoteBranch)
-	if _, err := os.Stat(remoteBranchPath); os.IsNotExist(err) {
-		return fmt.Errorf("remote branch '%s/%s' not found, try fetching first", remoteName, remoteBranch)
+	// Get remote branch commit
+	remoteBranchPath := filepath.Join(repo.VecDir, "refs", "remotes", remoteName, remoteBranch)
+	if !utils.FileExists(remoteBranchPath) {
+		return fmt.Errorf("remote branch '%s/%s' not found", remoteName, remoteBranch)
 	}
 
-	// Get the current branch
-	currentBranch, err := merge.GetCurrentBranch(repo.Root)
-	if err != nil {
-		return fmt.Errorf("failed to determine current branch: %w", err)
-	}
-
-	// Create a temporary branch name for the remote branch
-	tempBranchName := fmt.Sprintf("MERGE_HEAD_%s_%s", remoteName, remoteBranch)
-
-	// Read the remote branch commit hash
-	remoteCommitBytes, err := os.ReadFile(remoteBranchPath)
+	remoteBranchCommit, err := utils.ReadRef(repo.Root, filepath.Join("refs", "remotes", remoteName, remoteBranch))
 	if err != nil {
 		return fmt.Errorf("failed to read remote branch commit: %w", err)
 	}
 
-	// Create a temporary ref for the merge
-	tempRefPath := filepath.Join(vecDir, "refs", "heads", tempBranchName)
-	if err := os.MkdirAll(filepath.Dir(tempRefPath), 0755); err != nil {
-		return fmt.Errorf("failed to create temporary ref directory: %w", err)
-	}
-	if err := os.WriteFile(tempRefPath, remoteCommitBytes, 0644); err != nil {
-		return fmt.Errorf("failed to create temporary ref: %w", err)
+	// Get current branch commit
+	currentCommit, err := repo.GetHeadCommit()
+	if err != nil {
+		return fmt.Errorf("failed to get current commit: %w", err)
 	}
 
-	// Clean up the temporary branch when we're done
-	defer os.Remove(tempRefPath)
+	// Check if merge is needed
+	if currentCommit == remoteBranchCommit {
+		return fmt.Errorf("already up-to-date with '%s/%s'", remoteName, remoteBranch)
+	}
 
 	// Perform the merge
-	mergeConfig := &merge.MergeConfig{
-		Strategy:    merge.MergeStrategyRecursive,
-		Interactive: interactive,
-	}
-
-	fmt.Printf("Merging %s/%s into %s\n", remoteName, remoteBranch, currentBranch)
-	hasConflicts, err := merge.MergeRepo(repo, tempBranchName, mergeConfig)
+	mergeResult, err := merge.Merge(
+		repo.Root,
+		currentCommit,
+		remoteBranchCommit,
+		fmt.Sprintf("Merge remote branch '%s/%s' into %s", remoteName, remoteBranch, currentBranch),
+		interactive,
+	)
 	if err != nil {
-		if strings.Contains(err.Error(), "already up-to-date") {
-			fmt.Printf("Branch '%s' is already up-to-date with '%s/%s'\n",
-				currentBranch, remoteName, remoteBranch)
-			return nil
-		}
 		return fmt.Errorf("merge failed: %w", err)
 	}
 
-	if hasConflicts {
-		fmt.Printf("Merge conflicts between '%s' and '%s/%s'. Please resolve and commit.\n",
-			currentBranch, remoteName, remoteBranch)
-		return nil
+	if mergeResult.FastForward {
+		fmt.Printf("Fast-forward merge, updated %s to %s\n", currentBranch, mergeResult.MergeCommit[:7])
+	} else if mergeResult.Success {
+		fmt.Printf("Merge completed successfully, created commit %s\n", mergeResult.MergeCommit[:7])
+	} else {
+		return fmt.Errorf("merge resulted in conflicts, please resolve them manually")
 	}
 
-	fmt.Printf("Successfully merged '%s/%s' into '%s'\n",
-		remoteName, remoteBranch, currentBranch)
 	return nil
 }
 
-// ParseLastFetchedTime parses the timestamp from a fetch info file
-// This is an exported version of parseLastFetchedTime for use in commands
+// ParseLastFetchedTime is an exported version of parseLastFetchedTime
 func ParseLastFetchedTime(fetchInfo string) int64 {
 	return parseLastFetchedTime(fetchInfo)
 }
 
-// Prune removes stale remote references
-// This is an exported version of prune for use in commands
+// Prune is an exported version of prune
 func Prune(repoRoot, remoteName string) error {
 	return prune(repoRoot, remoteName)
 }

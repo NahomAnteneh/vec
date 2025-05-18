@@ -1,505 +1,387 @@
-// Package http provides a centralized HTTP client for all Vec remote operations
+// Package http provides a HTTP client for Vec remote operations
 package http
 
 import (
 	"bytes"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/NahomAnteneh/vec/internal/config"
 )
 
-// API version and constants
+// Common constants
 const (
-	// API Version
-	APIVersion = "v1"
-
 	// Default timeout for HTTP requests
 	DefaultTimeout = 60 * time.Second
-
-	// Endpoint paths
-	EndpointRefs         = "refs"
-	EndpointBranches     = "branches"
-	EndpointNegotiations = "negotiations"
-	EndpointPackfiles    = "packfiles"
-	EndpointPushes       = "pushes"
-
-	// Content types
+	
+	// Standard content type
 	ContentTypeJSON = "application/json"
-
-	// Max retry attempts
-	MaxRetryAttempts = 3
+	ContentTypeGit = "application/x-git"
 )
 
 // Common error types
 var (
-	ErrNetworkError         = errors.New("network error occurred")
-	ErrAuthenticationFailed = errors.New("authentication failed")
-	ErrResourceNotFound     = errors.New("resource not found")
-	ErrBadRequest           = errors.New("bad request")
-	ErrServerError          = errors.New("server error")
+	ErrNetworkError    = errors.New("network error occurred")
+	ErrNotFound        = errors.New("resource not found")
 )
 
-// Client represents the HTTP client for Vec remote operations
-type Client struct {
-	httpClient *http.Client
-	remoteURL  string
-	remoteName string
-	cfg        *config.Config
-	verbose    bool
+// Auth handles authentication for HTTP requests
+type Auth interface {
+	ApplyAuth(req *http.Request) error
 }
 
-// ResponseResult wraps the HTTP response and any error that occurred
-type ResponseResult struct {
-	Response *http.Response
-	Error    error
+// BasicAuth implements basic username/password authentication
+type BasicAuth struct {
+	Username string
+	Password string
 }
 
-// NewClient creates a new HTTP client for Vec remote operations
-func NewClient(remoteURL, remoteName string, cfg *config.Config) *Client {
-	return &Client{
-		httpClient: &http.Client{
-			Timeout: DefaultTimeout,
-		},
-		remoteURL:  remoteURL,
-		remoteName: remoteName,
-		cfg:        cfg,
-		verbose:    false,
+// ApplyAuth applies basic authentication to the request
+func (a *BasicAuth) ApplyAuth(req *http.Request) error {
+	if a.Username != "" {
+		req.SetBasicAuth(a.Username, a.Password)
 	}
+	return nil
 }
 
-// SetVerbose enables or disables verbose logging
-func (c *Client) SetVerbose(verbose bool) {
-	c.verbose = verbose
+// ConfigAuth loads authentication from configuration
+type ConfigAuth struct {
+	Config     *config.Config
+	RemoteName string
 }
 
-// SetTimeout sets the timeout for all requests
-func (c *Client) SetTimeout(timeout time.Duration) {
-	c.httpClient.Timeout = timeout
-}
-
-// buildURL creates a standardized URL for API requests
-func (c *Client) buildURL(endpoint string, params ...string) string {
-	baseURL := strings.TrimRight(c.remoteURL, "/")
-	apiPath := fmt.Sprintf("api/%s/%s", APIVersion, strings.TrimLeft(endpoint, "/"))
-
-	url := fmt.Sprintf("%s/%s", baseURL, apiPath)
-
-	// Add any additional path parameters
-	for _, param := range params {
-		if param != "" {
-			url = fmt.Sprintf("%s/%s", url, param)
-		}
-	}
-
-	return url
-}
-
-// applyAuthHeaders adds authentication headers to the request
-func (c *Client) applyAuthHeaders(req *http.Request) error {
-	if c.cfg == nil {
+// ApplyAuth applies authentication from config to the request
+func (a *ConfigAuth) ApplyAuth(req *http.Request) error {
+	if a.Config == nil {
 		return nil
 	}
 
-	// Try to get auth token from config
-	token, err := c.cfg.GetRemoteAuth(c.remoteName)
-	if err == nil && token != "" {
-		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
-		if c.verbose {
-			log.Printf("Added authorization header for remote '%s'", c.remoteName)
+	// Try username/password from config
+	username, err := a.Config.GetValue(fmt.Sprintf("remote.%s.username", a.RemoteName))
+	if err == nil && username != "" {
+		password, err := a.Config.GetValue(fmt.Sprintf("remote.%s.password", a.RemoteName))
+		if err == nil && password != "" {
+			req.SetBasicAuth(username, password)
+			return nil
 		}
 	}
 
-	// Add any custom headers from config
-	if c.cfg != nil {
-		headers, err := c.cfg.GetRemoteHeaders(c.remoteName)
-		if err == nil && headers != nil {
-			for key, value := range headers {
-				req.Header.Set(key, value)
-			}
-		}
+	// Try credentials file as fallback
+	creds, err := getCredentials(a.RemoteName)
+	if err == nil && creds.Username != "" {
+		req.SetBasicAuth(creds.Username, creds.Password)
 	}
 
 	return nil
 }
 
-// sendRequest sends an HTTP request with standardized headers, retries, and error handling
-func (c *Client) sendRequest(method, endpoint string, data interface{}, params ...string) (*ResponseResult, error) {
-	url := c.buildURL(endpoint, params...)
+// Credential holds user authentication information
+type Credential struct {
+	Username string
+	Password string
+}
 
-	// Prepare request body if data is provided
+// getCredentials retrieves credentials from the credentials file
+func getCredentials(remoteName string) (*Credential, error) {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get home directory: %w", err)
+	}
+
+	// Look for credentials in ~/.vec/credentials
+	credsPath := filepath.Join(homeDir, ".vec", "credentials")
+	if _, err := os.Stat(credsPath); os.IsNotExist(err) {
+		return &Credential{}, nil
+	}
+
+	credsData, err := os.ReadFile(credsPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read credentials file: %w", err)
+	}
+
+	// Parse the credentials file
+	lines := strings.Split(string(credsData), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		// Look for remote.{name}.username and remote.{name}.password
+		if strings.HasPrefix(line, fmt.Sprintf("remote.%s.username=", remoteName)) {
+			parts := strings.SplitN(line, "=", 2)
+			if len(parts) == 2 {
+				username := strings.TrimSpace(parts[1])
+				
+				// Look for corresponding password
+				for _, passwordLine := range lines {
+					passwordLine = strings.TrimSpace(passwordLine)
+					if strings.HasPrefix(passwordLine, fmt.Sprintf("remote.%s.password=", remoteName)) {
+						passParts := strings.SplitN(passwordLine, "=", 2)
+						if len(passParts) == 2 {
+							return &Credential{
+								Username: username,
+								Password: strings.TrimSpace(passParts[1]),
+							}, nil
+						}
+					}
+				}
+				
+				// Username found but no password
+				return &Credential{
+					Username: username,
+				}, nil
+			}
+		}
+	}
+
+	return &Credential{}, nil
+}
+
+// Client represents a simple HTTP client for Vec remote operations
+type Client struct {
+	httpClient *http.Client
+	remoteURL  string
+	remoteName string
+	config     *config.Config
+	auth       Auth
+	verbose    bool
+}
+
+// NewClient creates a new HTTP client
+func NewClient(remoteURL, remoteName string, cfg *config.Config) *Client {
+	client := &Client{
+		httpClient: &http.Client{
+			Timeout: DefaultTimeout,
+		},
+		remoteURL:  remoteURL,
+		remoteName: remoteName,
+		config:     cfg,
+		verbose:    false,
+	}
+	
+	// Set default auth from config
+	client.auth = &ConfigAuth{
+		Config:     cfg,
+		RemoteName: remoteName,
+	}
+	
+	return client
+}
+
+// SetAuth sets a custom authentication mechanism
+func (c *Client) SetAuth(auth Auth) {
+	c.auth = auth
+}
+
+// SetTimeout sets the timeout for HTTP requests
+func (c *Client) SetTimeout(timeout time.Duration) {
+	c.httpClient.Timeout = timeout
+}
+
+// SetVerbose enables or disables verbose output
+func (c *Client) SetVerbose(verbose bool) {
+	c.verbose = verbose
+}
+
+// Get performs a GET request to the remote server
+func (c *Client) Get(path string) ([]byte, error) {
+	url := c.buildURL(path)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	
+	// Add authentication
+	if c.auth != nil {
+		if err := c.auth.ApplyAuth(req); err != nil {
+			return nil, fmt.Errorf("failed to apply auth: %w", err)
+		}
+	}
+	
+	// Add standard headers
+	req.Header.Set("User-Agent", "Vec-Client/1.0")
+	req.Header.Set("Accept", ContentTypeJSON)
+	
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrNetworkError, err)
+	}
+	defer resp.Body.Close()
+	
+	// Check for error responses
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, ErrNotFound
+	}
+	
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("server returned error: %d %s", resp.StatusCode, resp.Status)
+	}
+	
+	return io.ReadAll(resp.Body)
+}
+
+// Post performs a POST request to the remote server
+func (c *Client) Post(path string, data interface{}) ([]byte, error) {
+	url := c.buildURL(path)
+	
 	var body io.Reader
 	if data != nil {
 		jsonData, err := json.Marshal(data)
 		if err != nil {
-			return nil, fmt.Errorf("failed to marshal request data: %w", err)
+			return nil, fmt.Errorf("failed to marshal data: %w", err)
 		}
 		body = bytes.NewBuffer(jsonData)
 	}
-
-	// Create request
-	req, err := http.NewRequest(method, url, body)
+	
+	req, err := http.NewRequest("POST", url, body)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create HTTP request: %w", err)
+		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
-
-	// Set standard headers for all requests
+	
+	// Add authentication
+	if c.auth != nil {
+		if err := c.auth.ApplyAuth(req); err != nil {
+			return nil, fmt.Errorf("failed to apply auth: %w", err)
+		}
+	}
+	
+	// Add standard headers
+	req.Header.Set("User-Agent", "Vec-Client/1.0")
 	req.Header.Set("Content-Type", ContentTypeJSON)
 	req.Header.Set("Accept", ContentTypeJSON)
-	req.Header.Set("User-Agent", "Vec-Client/0.1.0")
-	req.Header.Set("X-Vec-API-Version", APIVersion)
-
-	// Add authentication headers
-	if err := c.applyAuthHeaders(req); err != nil {
-		return nil, fmt.Errorf("failed to apply auth headers: %w", err)
-	}
-
-	// Log request if verbose
-	if c.verbose {
-		c.logRequest(req)
-	}
-
-	// Send request with retries
-	var resp *http.Response
-	var lastErr error
-
-	for attempt := 1; attempt <= MaxRetryAttempts; attempt++ {
-		resp, err = c.httpClient.Do(req)
-		if err == nil {
-			break // Success
-		}
-
-		lastErr = err
-		// Only retry on network errors, not on request creation errors
-		if attempt < MaxRetryAttempts {
-			if c.verbose {
-				log.Printf("Request attempt %d failed: %v. Retrying...", attempt, err)
-			}
-			time.Sleep(time.Duration(attempt) * time.Second)
-		}
-	}
-
+	
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrNetworkError, lastErr)
+		return nil, fmt.Errorf("%w: %v", ErrNetworkError, err)
 	}
-
-	// Log response if verbose
-	if c.verbose {
-		c.logResponse(resp)
+	defer resp.Body.Close()
+	
+	// Check for error responses
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("server returned error: %d %s", resp.StatusCode, resp.Status)
 	}
-
-	// Check for common error responses
-	result := &ResponseResult{
-		Response: resp,
-	}
-
-	switch resp.StatusCode {
-	case http.StatusOK, http.StatusCreated:
-		// Success - no error
-	case http.StatusUnauthorized:
-		resp.Body.Close()
-		result.Error = ErrAuthenticationFailed
-	case http.StatusNotFound:
-		result.Error = ErrResourceNotFound
-	case http.StatusBadRequest:
-		result.Error = ErrBadRequest
-	case http.StatusInternalServerError:
-		result.Error = ErrServerError
-	default:
-		result.Error = fmt.Errorf("unexpected status code: %d", resp.StatusCode)
-	}
-
-	return result, nil
+	
+	return io.ReadAll(resp.Body)
 }
 
-// logRequest logs non-sensitive information about the request
-func (c *Client) logRequest(req *http.Request) {
-	log.Printf("Request: %s %s", req.Method, req.URL.String())
-	log.Printf("Headers:")
-	for name, values := range req.Header {
-		// Don't log the full authorization token for security reasons
-		if strings.ToLower(name) == "authorization" {
-			log.Printf("  %s: Bearer [TOKEN REDACTED]", name)
-		} else {
-			log.Printf("  %s: %s", name, values)
+// PostBinary posts binary data (like packfiles) to the remote server
+func (c *Client) PostBinary(path string, data []byte) ([]byte, error) {
+	url := c.buildURL(path)
+	
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(data))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	
+	// Add authentication
+	if c.auth != nil {
+		if err := c.auth.ApplyAuth(req); err != nil {
+			return nil, fmt.Errorf("failed to apply auth: %w", err)
 		}
 	}
-	if req.Body != nil {
-		log.Printf("Body: [CONTENT NOT LOGGED]")
-	}
-}
-
-// logResponse logs information about the response
-func (c *Client) logResponse(resp *http.Response) {
-	log.Printf("Response: %d %s", resp.StatusCode, resp.Status)
-	log.Printf("Headers: %v", resp.Header)
-}
-
-// ReadResponseBody reads and closes the response body
-func ReadResponseBody(result *ResponseResult) ([]byte, error) {
-	if result.Error != nil {
-		return nil, result.Error
-	}
-
-	defer result.Response.Body.Close()
-
-	body, err := io.ReadAll(result.Response.Body)
+	
+	// Add standard headers
+	req.Header.Set("User-Agent", "Vec-Client/1.0")
+	req.Header.Set("Content-Type", ContentTypeGit)
+	req.Header.Set("Accept", ContentTypeJSON)
+	
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %w", err)
+		return nil, fmt.Errorf("%w: %v", ErrNetworkError, err)
 	}
-
-	return body, nil
+	defer resp.Body.Close()
+	
+	// Check for error responses
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("server returned error: %d %s", resp.StatusCode, resp.Status)
+	}
+	
+	return io.ReadAll(resp.Body)
 }
 
-// ===== API ENDPOINT METHODS =====
+// buildURL creates the full URL for a request
+func (c *Client) buildURL(path string) string {
+	baseURL := strings.TrimRight(c.remoteURL, "/")
+	path = strings.TrimLeft(path, "/")
+	return fmt.Sprintf("%s/%s", baseURL, path)
+}
 
-// FetchRefs retrieves all references from the remote repository
-func (c *Client) FetchRefs() (map[string]string, error) {
-	result, err := c.sendRequest("GET", EndpointRefs, nil)
+// GetRefs retrieves all references from the remote repository
+func (c *Client) GetRefs() (map[string]string, error) {
+	data, err := c.Get("info/refs")
 	if err != nil {
 		return nil, err
 	}
-
-	if result.Error != nil {
-		return nil, result.Error
-	}
-
-	defer result.Response.Body.Close()
-
-	// Try to decode as a direct map first
-	body, err := io.ReadAll(result.Response.Body)
+	
+	refs := make(map[string]string)
+	err = json.Unmarshal(data, &refs)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %w", err)
+		return nil, fmt.Errorf("failed to parse refs data: %w", err)
 	}
-
-	var refs map[string]string
-
-	// Try to decode as a direct map
-	if err := json.Unmarshal(body, &refs); err != nil {
-		// If that fails, try to decode as a wrapped object with a "refs" field
-		var wrappedRefs struct {
-			Refs map[string]string `json:"refs"`
-		}
-		if err := json.Unmarshal(body, &wrappedRefs); err != nil {
-			return nil, fmt.Errorf("failed to decode refs: %w", err)
-		}
-		refs = wrappedRefs.Refs
-	}
-
+	
 	return refs, nil
 }
 
-// GetBranchCommit retrieves the commit hash for a specific branch
-func (c *Client) GetBranchCommit(branchName string) (string, error) {
-	result, err := c.sendRequest("GET", EndpointBranches, nil, branchName)
-	if err != nil {
-		return "", err
-	}
-
-	if result.Error != nil {
-		if result.Error == ErrResourceNotFound {
-			return "", fmt.Errorf("branch %s not found on remote", branchName)
-		}
-		return "", result.Error
-	}
-
-	defer result.Response.Body.Close()
-
-	var response struct {
-		Commit string `json:"commit"`
-	}
-
-	if err := json.NewDecoder(result.Response.Body).Decode(&response); err != nil {
-		return "", fmt.Errorf("failed to decode response: %w", err)
-	}
-
-	return response.Commit, nil
-}
-
-// Negotiate determines which objects are missing by negotiating with the server
-func (c *Client) Negotiate(remoteRefs, localRefs map[string]string) ([]string, error) {
-	negotiationData := map[string]interface{}{
-		"want": remoteRefs,
-		"have": localRefs,
-	}
-
-	result, err := c.sendRequest("POST", EndpointNegotiations, negotiationData)
-	if err != nil {
-		return nil, err
-	}
-
-	if result.Error != nil {
-		return nil, result.Error
-	}
-
-	defer result.Response.Body.Close()
-
-	var missingObjects []string
-	if err := json.NewDecoder(result.Response.Body).Decode(&missingObjects); err != nil {
-		return nil, fmt.Errorf("failed to decode missing objects: %w", err)
-	}
-
-	return missingObjects, nil
-}
-
-// FetchPackfile retrieves a packfile containing the specified objects
-func (c *Client) FetchPackfile(objectsList []string) ([]byte, error) {
-	result, err := c.sendRequest("POST", EndpointPackfiles, objectsList)
-	if err != nil {
-		return nil, err
-	}
-
-	if result.Error != nil {
-		return nil, result.Error
-	}
-
-	defer result.Response.Body.Close()
-
-	packfile, err := io.ReadAll(result.Response.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read packfile: %w", err)
-	}
-
-	return packfile, nil
+// GetObject retrieves an object from the remote repository
+func (c *Client) GetObject(hash string) ([]byte, error) {
+	return c.Get(fmt.Sprintf("objects/%s", hash))
 }
 
 // PushResult contains the result of a push operation
 type PushResult struct {
-	Success bool     `json:"success"`
-	Message string   `json:"message"`
-	Errors  []string `json:"errors,omitempty"`
+	Success bool   `json:"success"`
+	Message string `json:"message"`
 }
 
-// Push sends a packfile and updates refs on the remote repository
-func (c *Client) Push(pushData map[string]interface{}, packfile []byte) (*PushResult, error) {
-	// Include packfile in push data
-	pushData["packfile"] = base64.StdEncoding.EncodeToString(packfile)
-
-	result, err := c.sendRequest("POST", EndpointPushes, pushData)
+// Push sends a packfile to the remote repository
+func (c *Client) Push(branchName, oldCommit, newCommit string, packfile []byte) (*PushResult, error) {
+	// First send the push info
+	pushInfo := map[string]string{
+		"branch":    branchName,
+		"oldCommit": oldCommit,
+		"newCommit": newCommit,
+	}
+	
+	infoData, err := c.Post("push/info", pushInfo)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to send push info: %w", err)
 	}
-
-	defer result.Response.Body.Close()
-
-	var pushResult PushResult
-
-	// Handle non-success status codes that weren't caught as errors
-	if result.Response.StatusCode != http.StatusOK && result.Response.StatusCode != http.StatusCreated {
-		bodyBytes, _ := io.ReadAll(result.Response.Body)
-		pushResult.Success = false
-		pushResult.Message = fmt.Sprintf("Server returned status %d: %s", result.Response.StatusCode, string(bodyBytes))
-		return &pushResult, nil
+	
+	// Parse response to check if we should continue
+	var infoResult struct {
+		Continue bool   `json:"continue"`
+		Message  string `json:"message"`
 	}
-
-	// Parse expected success response
-	if err := json.NewDecoder(result.Response.Body).Decode(&pushResult); err != nil {
-		return nil, fmt.Errorf("failed to decode push response: %w", err)
+	if err := json.Unmarshal(infoData, &infoResult); err != nil {
+		return nil, fmt.Errorf("failed to parse push info response: %w", err)
 	}
-
-	return &pushResult, nil
-}
-
-// Login performs authentication with the server
-func (c *Client) Login(username, password string) (string, string, error) {
-	// Prepare login request
-	loginReq := map[string]string{
-		"username": username,
-		"password": password,
+	
+	if !infoResult.Continue {
+		return &PushResult{
+			Success: false,
+			Message: infoResult.Message,
+		}, nil
 	}
-
-	// Make request
-	result, err := c.sendRequest("POST", "auth/login", loginReq)
+	
+	// Send the packfile
+	resultData, err := c.PostBinary("push/packfile", packfile)
 	if err != nil {
-		return "", "", fmt.Errorf("login request failed: %w", err)
+		return nil, fmt.Errorf("failed to send packfile: %w", err)
 	}
-	defer result.Response.Body.Close()
-
-	if result.Error != nil {
-		return "", "", result.Error
+	
+	// Parse the result
+	var result PushResult
+	if err := json.Unmarshal(resultData, &result); err != nil {
+		return nil, fmt.Errorf("failed to parse push result: %w", err)
 	}
-
-	// Parse response
-	var loginResp struct {
-		Token        string `json:"token"`
-		RefreshToken string `json:"refresh_token"`
-		ExpiresIn    int    `json:"expires_in"`
-	}
-
-	body, err := io.ReadAll(result.Response.Body)
-	if err != nil {
-		return "", "", fmt.Errorf("failed to read login response: %w", err)
-	}
-
-	if err := json.Unmarshal(body, &loginResp); err != nil {
-		return "", "", fmt.Errorf("failed to parse login response: %w", err)
-	}
-
-	if loginResp.Token == "" {
-		return "", "", fmt.Errorf("server returned empty token")
-	}
-
-	if c.verbose {
-		log.Printf("Successfully authenticated with server")
-		if loginResp.ExpiresIn > 0 {
-			log.Printf("Token expires in %d seconds", loginResp.ExpiresIn)
-		}
-	}
-
-	return loginResp.Token, loginResp.RefreshToken, nil
-}
-
-// RefreshToken attempts to refresh an expired token
-func (c *Client) RefreshToken(refreshToken string) (string, string, error) {
-	// Prepare refresh request
-	refreshReq := map[string]string{
-		"refresh_token": refreshToken,
-	}
-
-	// Make request
-	result, err := c.sendRequest("POST", "auth/refresh", refreshReq)
-	if err != nil {
-		return "", "", fmt.Errorf("token refresh request failed: %w", err)
-	}
-	defer result.Response.Body.Close()
-
-	if result.Error != nil {
-		return "", "", result.Error
-	}
-
-	// Parse response
-	var refreshResp struct {
-		Token        string `json:"token"`
-		RefreshToken string `json:"refresh_token"`
-		ExpiresIn    int    `json:"expires_in"`
-	}
-
-	body, err := io.ReadAll(result.Response.Body)
-	if err != nil {
-		return "", "", fmt.Errorf("failed to read refresh response: %w", err)
-	}
-
-	if err := json.Unmarshal(body, &refreshResp); err != nil {
-		return "", "", fmt.Errorf("failed to parse refresh response: %w", err)
-	}
-
-	if refreshResp.Token == "" {
-		return "", "", fmt.Errorf("server returned empty token")
-	}
-
-	if c.verbose {
-		log.Printf("Successfully refreshed authentication token")
-		if refreshResp.ExpiresIn > 0 {
-			log.Printf("New token expires in %d seconds", refreshResp.ExpiresIn)
-		}
-	}
-
-	return refreshResp.Token, refreshResp.RefreshToken, nil
+	
+	return &result, nil
 }

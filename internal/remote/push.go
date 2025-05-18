@@ -30,47 +30,53 @@ type PushResult struct {
 
 // PushOptions configures the behavior of the push operation
 type PushOptions struct {
-	// Force allows non-fast-forward updates
-	Force bool
-	// Verbose provides detailed progress information
-	Verbose bool
-	// Timeout specifies the maximum time for the entire push operation
-	Timeout time.Duration
-	// DryRun simulates a push without actually sending any data
-	DryRun bool
-	// Progress indicates whether to show progress information
+	Force    bool
+	Verbose  bool
+	Timeout  time.Duration
+	DryRun   bool
 	Progress bool
 }
 
-// DefaultPushOptions returns the default options for push operations
+// DefaultPushOptions returns the default push options
 func DefaultPushOptions() PushOptions {
 	return PushOptions{
 		Force:    false,
 		Verbose:  false,
-		Timeout:  5 * time.Minute,
+		Timeout:  2 * time.Minute,
 		DryRun:   false,
 		Progress: true,
 	}
 }
 
-// Push sends local commits to a remote repository
+// Push sends local commits to a remote repository - simplified command version
 func Push(repoRoot, remoteName, branchName string, force bool) error {
+	repo := core.NewRepository(repoRoot)
 	options := DefaultPushOptions()
 	options.Force = force
-	return PushWithOptions(repoRoot, remoteName, branchName, options)
+	return PushRepo(repo, remoteName, branchName, options)
 }
 
-// PushRepo sends local commits to a remote repository using Repository context
-func PushRepo(repo *core.Repository, remoteName, branchName string, force bool) error {
-	options := DefaultPushOptions()
-	options.Force = force
-	return PushWithOptionsRepo(repo, remoteName, branchName, options)
+// PushWithOptionsRepo is a convenience wrapper for PushRepo
+func PushWithOptionsRepo(repo *core.Repository, remoteName, branchName string, opts PushOptions) error {
+	return PushRepo(repo, remoteName, branchName, opts)
 }
 
-// PushWithOptionsRepo sends local commits to a remote repository with the specified options using Repository context
-func PushWithOptionsRepo(repo *core.Repository, remoteName, branchName string, options PushOptions) error {
+// PushRepo sends local commits to a remote repository
+func PushRepo(repo *core.Repository, remoteName, branchName string, opts PushOptions) error {
+	// If no branch specified, use current branch
+	if branchName == "" {
+		var err error
+		branchName, err = repo.GetCurrentBranch()
+		if err != nil {
+			return fmt.Errorf("failed to get current branch: %w", err)
+		}
+		if branchName == "(HEAD detached)" {
+			return fmt.Errorf("cannot push from detached HEAD state")
+		}
+	}
+	
 	// Load config
-	cfg, err := config.LoadConfigRepo(repo)
+	cfg, err := config.LoadConfig(repo.Root)
 	if err != nil {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
@@ -78,110 +84,103 @@ func PushWithOptionsRepo(repo *core.Repository, remoteName, branchName string, o
 	// Get remote URL
 	remoteURL, err := cfg.GetRemoteURL(remoteName)
 	if err != nil {
-		return fmt.Errorf("failed to get remote URL: %w", err)
+		return fmt.Errorf("remote '%s' not found", remoteName)
 	}
 
-	// Determine local branch
-	if branchName == "" {
-		// Get current branch
-		currentBranch, err := repo.GetCurrentBranch()
-		if err != nil {
-			return fmt.Errorf("failed to get current branch: %w", err)
-		}
-		branchName = currentBranch
-	}
-
-	if options.Verbose {
-		fmt.Printf("Pushing branch %s to remote %s...\n", branchName, remoteName)
-	}
-
-	// Get local branch commit
-	localCommitHash, err := getLocalBranchCommitRepo(repo, branchName)
+	// Get local reference
+	refPath := filepath.Join("refs", "heads", branchName)
+	localCommit, err := utils.ReadRef(repo.Root, refPath)
 	if err != nil {
-		return fmt.Errorf("failed to get local branch commit: %w", err)
+		return fmt.Errorf("failed to read local branch '%s': %w", branchName, err)
+	}
+	
+	// Create HTTP client
+	client := vechttp.NewClient(remoteURL, remoteName, cfg)
+	if opts.Verbose {
+		client.SetVerbose(true)
+	}
+	client.SetTimeout(opts.Timeout)
+	
+	// Get remote reference
+	var remoteCommit string
+	remoteRefs, err := client.GetRefs()
+	if err != nil {
+		if err != vechttp.ErrNotFound {
+			return fmt.Errorf("failed to get remote refs: %w", err)
+		}
+		// Remote ref not found - new branch
+	} else {
+		// Look for the branch in remote refs
+		remoteRefName := fmt.Sprintf("refs/heads/%s", branchName)
+		remoteCommit = remoteRefs[remoteRefName]
 	}
 
-	// Get remote branch commit, if it exists
-	remoteCommitHash, err := getRemoteBranchCommit(remoteURL, remoteName, branchName, cfg)
-	if err != nil && !strings.Contains(err.Error(), "not found") {
-		return fmt.Errorf("failed to get remote branch commit: %w", err)
-	}
-
-	// Check if we need to push (no change if remote is already up to date)
-	if localCommitHash == remoteCommitHash {
-		if options.Verbose {
-			fmt.Printf("Branch %s is already up to date on remote %s\n", branchName, remoteName)
+	// Check if update is needed
+	if localCommit == remoteCommit {
+		if opts.Verbose {
+			fmt.Printf("Branch '%s' is already up to date on remote '%s'\n", branchName, remoteName)
 		}
 		return nil
 	}
 
 	// If not forcing, verify this is a fast-forward push
-	if !options.Force && remoteCommitHash != "" {
-		isFastForward, err := isFastForwardUpdateRepo(repo, localCommitHash, remoteCommitHash)
+	if !opts.Force && remoteCommit != "" {
+		isFastForward, err := isAncestor(repo.Root, remoteCommit, localCommit)
 		if err != nil {
 			return fmt.Errorf("failed to check if update is fast-forward: %w", err)
 		}
 		if !isFastForward {
-			return fmt.Errorf("non-fast-forward update. Use --force to override")
+			return fmt.Errorf("non-fast-forward update - use --force to override")
 		}
 	}
 
-	// Find all objects that need to be sent
-	if options.Verbose {
-		fmt.Println("Determining objects to send...")
-	}
-
-	objectsToSend, err := getObjectsToSendRepo(repo, localCommitHash, remoteCommitHash)
-	if err != nil {
-		return fmt.Errorf("failed to determine objects to send: %w", err)
-	}
-
-	if len(objectsToSend) == 0 {
-		if options.Verbose {
-			fmt.Println("No objects to send. Remote is up to date.")
+	// Early return for dry run
+	if opts.DryRun {
+		if opts.Verbose {
+			if remoteCommit == "" {
+				fmt.Printf("Dry run: Would push new branch '%s' to remote '%s'\n", branchName, remoteName)
+			} else {
+				fmt.Printf("Dry run: Would update remote '%s' branch '%s' from %s to %s\n", 
+					remoteName, branchName, shortCommitID(remoteCommit), shortCommitID(localCommit))
+			}
 		}
 		return nil
 	}
+	
+	// Find all objects to send
+	if opts.Verbose {
+		fmt.Println("Determining objects to send...")
+	}
 
-	// Early return for dry run mode
-	if options.DryRun {
-		if options.Verbose {
-			fmt.Printf("Dry run: Would push %d objects to update branch %s on remote %s\n",
-				len(objectsToSend), branchName, remoteName)
-			fmt.Printf("Dry run: Would update remote ref from %s to %s\n",
-				formatCommitHash(remoteCommitHash), formatCommitHash(localCommitHash))
+	objectsToSend, err := findObjectsToPush(repo.Root, localCommit, remoteCommit)
+	if err != nil {
+		return fmt.Errorf("failed to find objects to push: %w", err)
+	}
+
+	if len(objectsToSend) == 0 {
+		if opts.Verbose {
+			fmt.Println("No objects to send")
 		}
 		return nil
 	}
 
 	// Create packfile
-	if options.Progress || options.Verbose {
+	if opts.Progress || opts.Verbose {
 		fmt.Printf("Creating packfile with %d objects...\n", len(objectsToSend))
 	}
 
-	packfile, err := createPackfileRepo(repo, objectsToSend)
+	packData, err := packfile.CreatePackfile(repo.Root, objectsToSend)
 	if err != nil {
 		return fmt.Errorf("failed to create packfile: %w", err)
 	}
 
 	// Send packfile and update refs
-	pushData := map[string]interface{}{
-		"branch":    branchName,
-		"oldCommit": remoteCommitHash,
-		"newCommit": localCommitHash,
-		"force":     options.Force,
+	if opts.Progress || opts.Verbose {
+		fmt.Printf("Sending objects to remote '%s'...\n", remoteName)
 	}
 
-	// Perform push with timeout
-	client := &http.Client{
-		Timeout: options.Timeout,
-	}
-
-	if options.Progress || options.Verbose {
-		fmt.Println("Sending packfile to remote...")
-	}
-
-	result, err := performPushWithClient(remoteURL, remoteName, pushData, packfile, cfg, client)
+	// Perform push
+	result, err := client.Push(branchName, remoteCommit, localCommit, packData)
 	if err != nil {
 		return fmt.Errorf("push failed: %w", err)
 	}
@@ -190,22 +189,101 @@ func PushWithOptionsRepo(repo *core.Repository, remoteName, branchName string, o
 		return fmt.Errorf("push rejected: %s", result.Message)
 	}
 
-	if options.Verbose {
-		fmt.Printf("Successfully pushed branch %s to %s\n", branchName, remoteName)
-		if len(result.Message) > 0 {
-			fmt.Printf("Server message: %s\n", result.Message)
-		}
-	} else if options.Progress {
-		fmt.Printf("Successfully pushed branch %s to %s\n", branchName, remoteName)
+	if opts.Verbose || opts.Progress {
+		fmt.Printf("Branch '%s' pushed to '%s'\n", branchName, remoteName)
 	}
 
 	return nil
 }
 
-// Legacy function for backward compatibility
-func PushWithOptions(repoRoot, remoteName, branchName string, options PushOptions) error {
-	repo := core.NewRepository(repoRoot)
-	return PushWithOptionsRepo(repo, remoteName, branchName, options)
+// shortCommitID returns a shortened commit ID for display
+func shortCommitID(commit string) string {
+	if len(commit) <= 7 {
+		return commit
+	}
+	return commit[:7]
+}
+
+// isAncestor checks if possibleAncestor is an ancestor of commit
+func isAncestor(repoRoot, possibleAncestor, commit string) (bool, error) {
+	if possibleAncestor == "" || commit == "" {
+		return false, nil
+	}
+	
+	// Quick check: if they're the same commit
+	if possibleAncestor == commit {
+		return true, nil
+	}
+	
+	// Get commit history
+	visited := make(map[string]bool)
+	stack := []string{commit}
+	
+	for len(stack) > 0 {
+		// Pop current commit
+		current := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		
+		// Skip if already visited
+		if visited[current] {
+			continue
+		}
+		visited[current] = true
+		
+		// Check if this is the ancestor we're looking for
+		if current == possibleAncestor {
+			return true, nil
+		}
+		
+		// Get parents of this commit
+		commitObj, err := objects.GetCommit(repoRoot, current)
+		if err != nil {
+			continue // Skip on error
+		}
+		
+		// Add parents to stack
+		stack = append(stack, commitObj.Parents...)
+	}
+	
+	return false, nil
+}
+
+// findObjectsToPush finds all objects that need to be sent to the remote
+func findObjectsToPush(repoRoot, localCommit, remoteCommit string) ([]string, error) {
+	// Get all objects reachable from local commit
+	localObjects, err := objects.FindReachableObjects(repoRoot, localCommit)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find local objects: %w", err)
+	}
+	
+	// If no remote commit, send all local objects
+	if remoteCommit == "" {
+		return localObjects, nil
+	}
+	
+	// Get all objects reachable from remote commit
+	remoteObjects, err := objects.FindReachableObjects(repoRoot, remoteCommit)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find remote objects: %w", err)
+	}
+	
+	// Find the difference (objects in local but not in remote)
+	objectsToSend := make([]string, 0)
+	
+	for _, obj := range localObjects {
+		found := false
+		for _, remote := range remoteObjects {
+			if obj == remote {
+				found = true
+				break
+			}
+		}
+		if !found {
+			objectsToSend = append(objectsToSend, obj)
+		}
+	}
+	
+	return objectsToSend, nil
 }
 
 // formatCommitHash formats a commit hash for display
@@ -704,3 +782,4 @@ func createPackfileRepo(repo *core.Repository, objectHashes []string) ([]byte, e
 
 	return content, nil
 }
+
